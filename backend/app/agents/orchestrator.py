@@ -12,6 +12,43 @@ from app.db.vector_store import vector_store
 from app.services.service_manager import service_manager
 
 
+def _to_list(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    return [str(value)]
+
+
+def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    if not plan:
+        return plan
+    normalized = dict(plan)
+    steps = normalized.get("steps") or []
+    new_steps = []
+    for step in steps:
+        s = dict(step)
+        s["select"] = _to_list(s.get("select"))
+        s["expand"] = _to_list(s.get("expand"))
+        ob = s.get("orderby")
+        if isinstance(ob, list):
+            s["orderby"] = ", ".join(str(x) for x in ob if x) if ob else None
+        for int_field in ("top", "skip"):
+            v = s.get(int_field)
+            if v == "" or v is None:
+                s[int_field] = None
+            elif isinstance(v, str):
+                try:
+                    s[int_field] = int(v)
+                except (TypeError, ValueError):
+                    s[int_field] = None
+        new_steps.append(s)
+    normalized["steps"] = new_steps
+    return normalized
+
+
 class Orchestrator:
     async def run(
         self,
@@ -42,6 +79,7 @@ class Orchestrator:
 
         discovery = await discovery_agent.discover(user_query)
         plan = await llm_engine.plan(user_query, services, memory_context=memory)
+        plan = _normalize_plan(plan)
 
         tool_calls: List[Dict[str, Any]] = []
         execution_results: List[Dict[str, Any]] = []

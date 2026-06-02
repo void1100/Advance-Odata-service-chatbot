@@ -21,9 +21,10 @@ structured orchestration plan:
   "summary": "Show top 10 customers in the USA with their orders"
 }
 
-It supports two providers:
+It supports three providers:
   - "mock": heuristic intent/entity extraction (always available)
   - "openai": uses the OpenAI chat completions API (requires OPENAI_API_KEY)
+  - "gemini": uses Google Gemini via google-genai (requires GEMINI_API_KEY)
 """
 import json
 import re
@@ -48,6 +49,11 @@ class LLMReasoningEngine:
                 return await self._plan_openai(query, available_services, memory_context)
             except Exception as e:
                 logger.warning(f"OpenAI planning failed, falling back to mock: {e}")
+        elif self.provider == "gemini" and settings.gemini_api_key:
+            try:
+                return await self._plan_gemini(query, available_services, memory_context)
+            except Exception as e:
+                logger.warning(f"Gemini planning failed, falling back to mock: {e}")
         return self._plan_mock(query, available_services, memory_context)
 
     def _plan_mock(
@@ -311,7 +317,10 @@ class LLMReasoningEngine:
     ) -> Dict[str, Any]:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url or None,
+        )
         system_prompt = (
             "You are an OData query planner. Given a natural language question "
             "and a list of available OData services, output JSON with keys: "
@@ -340,6 +349,50 @@ class LLMReasoningEngine:
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content
+        try:
+            return json.loads(content)
+        except Exception:
+            return self._plan_mock(query, services, memory_context)
+
+    async def _plan_gemini(
+        self,
+        query: str,
+        services: List[Dict[str, Any]],
+        memory_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=settings.gemini_api_key)
+        model = settings.llm_model or "gemini-2.0-flash"
+        system_prompt = (
+            "You are an OData query planner. Given a natural language question "
+            "and a list of available OData services, output JSON with keys: "
+            "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
+            "and summary. Use only services and entity sets provided."
+        )
+        user_prompt = json.dumps({
+            "query": query,
+            "services": [
+                {
+                    "id": s["id"],
+                    "name": s["name"],
+                    "entity_sets": s.get("entity_sets", []),
+                    "description": s.get("description", ""),
+                }
+                for s in services
+            ],
+            "memory_context": memory_context or [],
+        })
+        resp = await client.aio.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+            ),
+        )
+        content = resp.text or ""
         try:
             return json.loads(content)
         except Exception:

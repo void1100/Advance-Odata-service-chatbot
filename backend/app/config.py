@@ -15,6 +15,8 @@ class Settings(BaseSettings):
 
     llm_provider: str = "mock"
     openai_api_key: str = ""
+    openai_base_url: str = ""
+    gemini_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
     embedding_model: str = "all-MiniLM-L6-v2"
 
