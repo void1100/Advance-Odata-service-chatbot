@@ -1,8 +1,11 @@
 import os
 import sys
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
@@ -24,6 +27,7 @@ from app.schemas.models import (
 from app.services.service_manager import service_manager
 from app.agents.orchestrator import orchestrator
 from app.agents.policy_engine import policy_engine
+from app.agents.reasoning_engine import llm_engine
 from app.db.sqlite_store import (
     add_message,
     add_run,
@@ -125,9 +129,120 @@ async def refresh_service(service_id: str):
     )
 
 
+async def _probe_service(svc: Dict[str, Any]) -> Dict[str, Any]:
+    base = (svc.get("base_url") or "").rstrip("/")
+    url = f"{base}/$metadata"
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"Accept": "application/xml"})
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        if resp.status_code == 200:
+            status = "healthy"
+        elif 500 <= resp.status_code < 600:
+            status = "down"
+        else:
+            status = "degraded"
+        return {
+            "id": svc["id"],
+            "name": svc["name"],
+            "status": status,
+            "http_status": resp.status_code,
+            "latency_ms": latency_ms,
+        }
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        return {
+            "id": svc["id"],
+            "name": svc["name"],
+            "status": "down",
+            "http_status": None,
+            "latency_ms": latency_ms,
+            "error": str(e)[:200],
+        }
+
+
+@app.get("/services/health")
+async def services_health():
+    services = service_manager.list_services()
+    results = await asyncio.gather(*[_probe_service(s) for s in services])
+    return {"services": results}
+
+
 @app.get("/roles")
 async def get_roles():
     return policy_engine.list_roles()
+
+
+LLM_CATALOG = [
+    {"id": "mock", "provider": "mock", "label": "Mock (no LLM call)", "model": "mock", "requires": []},
+    {"id": "openai-gpt-4o-mini", "provider": "openai", "label": "OpenAI: GPT-4o mini (fast, cheap)", "model": "gpt-4o-mini", "requires": ["openai_key"]},
+    {"id": "openai-gpt-4o", "provider": "openai", "label": "OpenAI: GPT-4o (smartest)", "model": "gpt-4o", "requires": ["openai_key"]},
+    {"id": "openai-gpt-3.5-turbo", "provider": "openai", "label": "OpenAI: GPT-3.5 Turbo (legacy)", "model": "gpt-3.5-turbo", "requires": ["openai_key"]},
+    {"id": "groq-llama-3.3-70b", "provider": "openai", "label": "Groq: Llama 3.3 70B Versatile", "model": "llama-3.3-70b-versatile", "requires": ["openai_key", "groq_base_url"]},
+    {"id": "groq-llama-3.1-8b", "provider": "openai", "label": "Groq: Llama 3.1 8B Instant (fastest)", "model": "llama-3.1-8b-instant", "requires": ["openai_key", "groq_base_url"]},
+    {"id": "groq-mixtral-8x7b", "provider": "openai", "label": "Groq: Mixtral 8x7B (32k ctx)", "model": "mixtral-8x7b-32768", "requires": ["openai_key", "groq_base_url"]},
+    {"id": "gemini-flash", "provider": "gemini", "label": "Gemini: Flash (latest)", "model": "gemini-flash-latest", "requires": ["gemini_key"]},
+    {"id": "gemini-2.0-flash", "provider": "gemini", "label": "Gemini: 2.0 Flash", "model": "gemini-2.0-flash", "requires": ["gemini_key"]},
+]
+
+
+def _llm_requirements_status() -> Dict[str, bool]:
+    return {
+        "openai_key": bool(settings.openai_api_key),
+        "gemini_key": bool(settings.gemini_api_key),
+        "groq_base_url": "groq.com" in (settings.openai_base_url or ""),
+    }
+
+
+@app.get("/llm/config")
+async def get_llm_config():
+    status = _llm_requirements_status()
+    options = []
+    for opt in LLM_CATALOG:
+        available = all(status.get(req, False) for req in opt["requires"])
+        reason = None
+        if not available:
+            missing = [req for req in opt["requires"] if not status.get(req, False)]
+            reason = "Missing: " + ", ".join(missing)
+        options.append({**opt, "available": available, "reason": reason})
+    current_id = None
+    for opt in LLM_CATALOG:
+        if opt["provider"] == llm_engine.provider and opt["model"] == llm_engine.model:
+            current_id = opt["id"]
+            break
+    if current_id is None:
+        current_id = f"custom:{llm_engine.provider}:{llm_engine.model}"
+    return {
+        "current": {
+            "id": current_id,
+            "provider": llm_engine.provider,
+            "model": llm_engine.model,
+        },
+        "options": options,
+        "requirements": status,
+    }
+
+
+@app.post("/llm/config")
+async def set_llm_config(payload: Dict[str, Any]):
+    provider = payload.get("provider")
+    model = payload.get("model")
+    option_id = payload.get("id")
+    if option_id and option_id != "custom":
+        opt = next((o for o in LLM_CATALOG if o["id"] == option_id), None)
+        if not opt:
+            raise HTTPException(status_code=404, detail=f"Unknown LLM option: {option_id}")
+        status = _llm_requirements_status()
+        if not all(status.get(req, False) for req in opt["requires"]):
+            missing = [req for req in opt["requires"] if not status.get(req, False)]
+            raise HTTPException(status_code=400, detail=f"Cannot select {opt['label']}: missing {', '.join(missing)}")
+        provider = opt["provider"]
+        model = opt["model"]
+    if not provider or not model:
+        raise HTTPException(status_code=400, detail="Must provide 'provider' and 'model', or a valid 'id'")
+    llm_engine.set_config(provider=provider, model=model)
+    return {"ok": True, "provider": llm_engine.provider, "model": llm_engine.model}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -163,10 +278,24 @@ async def chat(payload: ChatRequest):
 
     plan_obj = None
     if result.get("plan"):
-        plan_obj = Plan(**result["plan"])
+        from app.agents.orchestrator import _normalize_plan
+        for _ in range(3):
+            try:
+                plan_obj = Plan(**result["plan"])
+                break
+            except Exception as e:
+                logger.warning(f"Plan validation failed (attempt), re-normalizing: {e}")
+                result["plan"] = _normalize_plan(result["plan"])
+        if plan_obj is None:
+            logger.error("Plan validation failed repeatedly, dropping plan")
+            result["plan"] = None
     table_obj = None
     if result.get("table"):
-        table_obj = TableData(**result["table"])
+        try:
+            table_obj = TableData(**result["table"])
+        except Exception as e:
+            logger.warning(f"Table validation failed: {e}")
+            table_obj = None
 
     return ChatResponse(
         run_id=result["run_id"],
@@ -183,6 +312,9 @@ async def chat(payload: ChatRequest):
         primary_service=result.get("primary_service"),
         error=result.get("error"),
         memory_used=result.get("memory_used", []),
+        llm_provider=result.get("llm_provider", "unknown"),
+        llm_latency_ms=result.get("llm_latency_ms", 0),
+        llm_tokens=result.get("llm_tokens", 0),
     )
 
 

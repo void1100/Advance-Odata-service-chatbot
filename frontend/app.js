@@ -22,6 +22,7 @@ const sessionList = $("sessionList");
 const queryInput = $("queryInput");
 const sendBtn = $("sendBtn");
 const roleSelect = $("roleSelect");
+const llmSelect = $("llmSelect");
 const newChatBtn = $("newChatBtn");
 const servicesBtn = $("servicesBtn");
 const servicesModal = $("servicesModal");
@@ -142,16 +143,33 @@ function addAssistantBubble(summary, result, scroll = true) {
   const div = document.createElement("div");
   div.className = "bubble assistant";
   div.textContent = summary || "Done.";
+  if (result && result.llm) {
+    const badge = document.createElement("div");
+    badge.className = `llm-badge llm-${result.llm.provider}`;
+    const provider = result.llm.provider || "unknown";
+    const latency = result.llm.latency_ms != null ? `${result.llm.latency_ms}ms` : "?";
+    const tokens = result.llm.tokens ? ` · ${result.llm.tokens} tokens` : "";
+    const corrected = result.llm.corrected ? " · self-corrected" : "";
+    badge.textContent = `LLM: ${provider} · ${latency}${tokens}${corrected}`;
+    div.appendChild(badge);
+  }
   if (result && result.table) {
-    const wrap = renderTable(result.table);
-    if (wrap) div.appendChild(wrap);
+    const tableWrap = renderTable(result.table);
+    if (tableWrap) {
+      const panel = buildResultPanel(result.table);
+      div.appendChild(panel.panelEl);
+      tableWrap.style.display = "";
+      panel.tableView.appendChild(tableWrap);
+      requestAnimationFrame(() => panel.renderGraph());
+    }
   }
   if (result && result.tool_calls && result.tool_calls.length) {
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.innerHTML = result.tool_calls.map((t) => {
       if (t.type === "odata.query") {
-        return `<span class="tool-pill">${escapeHtml(t.service_id)}/${escapeHtml(t.entity_set)}</span> ${t.row_count} rows<div class="url-line">${escapeHtml(t.url || "")}</div>`;
+        const correctedTag = t.corrected ? ` <span class="tool-pill corrected">corrected</span>` : "";
+        return `<span class="tool-pill">${escapeHtml(t.service_id)}/${escapeHtml(t.entity_set)}</span> ${t.row_count} rows${correctedTag}<div class="url-line">${escapeHtml(t.url || "")}</div>`;
       }
       return `<span class="tool-pill">error</span> ${escapeHtml(t.error || "")}`;
     }).join("");
@@ -161,10 +179,45 @@ function addAssistantBubble(summary, result, scroll = true) {
   if (scroll) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+function tableToCsv(table) {
+  const escape = (v) => {
+    if (v == null) return "";
+    let s = typeof v === "object" ? JSON.stringify(v) : String(v);
+    if (/[",\n\r]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const head = table.columns.map(escape).join(",");
+  const body = table.rows.map((r) => table.columns.map((c) => escape(r[c])).join(",")).join("\r\n");
+  return head + "\r\n" + body;
+}
+
+function downloadCsv(table, label) {
+  const csv = tableToCsv(table);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const safe = (label || "result").replace(/[^\w-]+/g, "_").slice(0, 40);
+  a.download = `${safe}_${new Date().toISOString().slice(0,19).replace(/[:T]/g, "-")}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function renderTable(table) {
   if (!table || !table.columns || !table.rows || !table.rows.length) return null;
   const wrap = document.createElement("div");
   wrap.className = "table-wrapper";
+  const toolbar = document.createElement("div");
+  toolbar.className = "table-toolbar";
+  const csvBtn = document.createElement("button");
+  csvBtn.className = "csv-btn";
+  csvBtn.textContent = "Download CSV";
+  csvBtn.title = `Export ${table.rows.length} rows to CSV`;
+  csvBtn.addEventListener("click", () => downloadCsv(table, "odata_result"));
+  toolbar.appendChild(csvBtn);
+  wrap.appendChild(toolbar);
   const tableEl = document.createElement("table");
   const thead = document.createElement("thead");
   const trh = document.createElement("tr");
@@ -201,6 +254,496 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+function classifyColumns(table) {
+  const cols = (table.columns || []).filter((c) => !c.startsWith("@odata.") && !c.startsWith("odata.") && c !== "odata.etag");
+  const rows = table.rows || [];
+  const info = {};
+  for (const c of cols) {
+    const values = rows.map((r) => r[c]).filter((v) => v != null && v !== "");
+    const types = new Set(values.map((v) => typeof v));
+    const numericVals = values.filter((v) => typeof v === "number" || (typeof v === "string" && v.trim() !== "" && !isNaN(parseFloat(v)) && isFinite(v)));
+    const isNumeric = values.length > 0 && numericVals.length === values.length;
+    const isNumericPure = values.length > 0 && [...types].every((t) => t === "number");
+    const unique = new Set(values.map((v) => String(v)));
+    const uniqueCount = unique.size;
+    info[c] = {
+      type: isNumericPure ? "numeric" : [...types].every((t) => t === "string") ? "string" : "mixed",
+      uniqueCount,
+      isNumeric,
+      isLikelyID: /(^|[^a-z])(ID|Id|Code|Key)$/i.test(c) && uniqueCount >= Math.min(values.length, 2),
+      isLikelyName: /(Name|Title|Company|Contact|Category|Status|Region|Country|City|ShipName|ProductName|CategoryName|Suppliers|Category|Customer|Employee|Manager|Owner)$/i.test(c),
+      isDate: /(Date|Time|edAt|edOn)$/i.test(c),
+      isLowCardinality: uniqueCount > 1 && uniqueCount <= 8,
+      isMediumCardinality: uniqueCount > 8 && uniqueCount <= 30,
+    };
+  }
+  return info;
+}
+
+function detectEntityGroups(cols, colInfo) {
+  const groups = new Map();
+  for (const c of cols) {
+    const m = c.match(/^(.+?)(ID|Name|Code|Key|Title)$/i);
+    if (m) {
+      const entity = m[1];
+      if (!groups.has(entity)) groups.set(entity, []);
+      groups.get(entity).push(c);
+    } else if (colInfo[c] && colInfo[c].isLikelyID) {
+      const entity = c.replace(/(ID|Id|Code|Key)$/i, "");
+      if (entity && !groups.has(entity)) groups.set(entity, [c]);
+    }
+  }
+  return Array.from(groups.entries())
+    .filter(([, cs]) => cs.length >= 1)
+    .map(([entity, cs]) => ({ entity, columns: cs }));
+}
+
+function aggregateByCategory(rows, categoryCol, metricCol, isCountMetric) {
+  const groups = new Map();
+  for (const r of rows) {
+    const key = r[categoryCol] == null ? "N/A" : String(r[categoryCol]);
+    let val = 0;
+    if (isCountMetric) {
+      val = 1;
+    } else if (metricCol) {
+      const n = parseFloat(r[metricCol]);
+      val = isNaN(n) ? 0 : n;
+    }
+    if (!groups.has(key)) groups.set(key, 0);
+    groups.set(key, groups.get(key) + val);
+  }
+  return Array.from(groups.entries())
+    .map(([label, value]) => ({ label: label.length > 30 ? label.slice(0, 30) + "..." : label, value }))
+    .sort((a, b) => b.value - a.value);
+}
+
+function buildNetworkData(rows, entityGroups, cols, colInfo) {
+  const nodes = [];
+  const nodeSet = new Set();
+  const edges = [];
+  for (const r of rows) {
+    const rowNodeIds = [];
+    for (const { entity, columns } of entityGroups) {
+      const nameCol = columns.find((c) => /(Name|Title|Code)/i.test(c)) || columns[0];
+      const idCol = columns.find((c) => /(ID|Code|Key)/i.test(c)) || nameCol;
+      const idVal = r[idCol];
+      if (idVal == null || idVal === "") continue;
+      const nodeId = `${entity}-${idVal}`;
+      if (!nodeSet.has(nodeId)) {
+        nodeSet.add(nodeId);
+        const label = r[nameCol] != null ? String(r[nameCol]) : String(idVal);
+        const displayLabel = label.length > 24 ? label.slice(0, 24) + "..." : label;
+        nodes.push({ id: nodeId, label: displayLabel, group: entity });
+      }
+      rowNodeIds.push(nodeId);
+    }
+    for (let i = 0; i < rowNodeIds.length; i++) {
+      for (let j = i + 1; j < rowNodeIds.length; j++) {
+        edges.push({ from: rowNodeIds[i], to: rowNodeIds[j] });
+      }
+    }
+  }
+  const groupNames = entityGroups.map((g) => g.entity);
+  return { nodes, edges, groups: groupNames };
+}
+
+function generateInsights(table, colInfo, pie, bar, network, entityGroups) {
+  const insights = [];
+  if (pie && pie.values.length > 0) {
+    const total = pie.values.reduce((a, b) => a + b, 0);
+    const topVal = pie.values[0];
+    const topPct = total > 0 ? ((topVal / total) * 100).toFixed(0) : 0;
+    insights.push(`"${pie.labels[0]}" leads with ${topVal} (${topPct}% of ${pie.metric})`);
+    if (pie.values.length >= 3) {
+      const top3 = pie.values.slice(0, 3).reduce((a, b) => a + b, 0);
+      const top3Pct = total > 0 ? ((top3 / total) * 100).toFixed(0) : 0;
+      insights.push(`Top 3 ${pie.category}s account for ${top3Pct}% of all ${pie.metric}`);
+    }
+  }
+  if (network && network.nodes.length > 0 && network.edges.length > 0) {
+    const degree = {};
+    for (const n of network.nodes) degree[n.id] = 0;
+    for (const e of network.edges) {
+      degree[e.from] = (degree[e.from] || 0) + 1;
+      degree[e.to] = (degree[e.to] || 0) + 1;
+    }
+    const ranked = network.nodes
+      .map((n) => ({ ...n, degree: degree[n.id] || 0 }))
+      .sort((a, b) => b.degree - a.degree);
+    if (ranked[0] && ranked[0].degree > 0) {
+      insights.push(`Hub: "${ranked[0].label}" connects to ${ranked[0].degree} other node${ranked[0].degree === 1 ? "" : "s"}`);
+    }
+    if (network.groups.length >= 2) {
+      insights.push(`${network.groups.length} entity types linked: ${network.groups.join(" → ")}`);
+    }
+  }
+  if (!insights.length && table.rows.length > 0) {
+    insights.push(`${table.rows.length} row${table.rows.length === 1 ? "" : "s"} across ${table.columns.length} columns`);
+  }
+  return insights;
+}
+
+function analyzeTable(table) {
+  const allCols = table.columns || [];
+  const rows = table.rows || [];
+  if (!allCols.length || !rows.length) {
+    return { suggested: "table", reason: "No data to visualize", pie: null, bar: null, network: null, insights: [], colInfo: {}, entityGroups: [] };
+  }
+  const colInfo = classifyColumns(table);
+  const cols = Object.keys(colInfo);
+  const entityGroups = detectEntityGroups(cols, colInfo);
+  const numericCols = cols.filter((c) => colInfo[c].isNumeric);
+  const stringCols = cols.filter((c) => colInfo[c].type === "string" || colInfo[c].type === "mixed");
+  const lowCardCols = stringCols.filter((c) => colInfo[c].isLowCardinality);
+  const mediumCardCols = stringCols.filter((c) => colInfo[c].isMediumCardinality);
+  const idCols = cols.filter((c) => colInfo[c].isLikelyID);
+  const isCountMetric = (c) => /^count$|Count$|Quantity$/i.test(c);
+  let pie = null, bar = null, network = null;
+  let suggested = "table";
+  let reason = "No suitable dimensions detected";
+  if (lowCardCols.length > 0 && (numericCols.length > 0 || rows.length > 0)) {
+    const cat = lowCardCols[0];
+    const metric = numericCols[0] || null;
+    const isCount = metric ? isCountMetric(metric) : true;
+    const data = aggregateByCategory(rows, cat, metric, isCount);
+    if (data.length >= 2 && data.length <= 8) {
+      pie = { labels: data.map((d) => d.label), values: data.map((d) => d.value), category: cat, metric: metric || "count" };
+    }
+  }
+  const catCol = lowCardCols[0] || mediumCardCols[0] || stringCols[0];
+  if (catCol) {
+    const metric = numericCols[0] || null;
+    const isCount = metric ? isCountMetric(metric) : true;
+    const data = aggregateByCategory(rows, catCol, metric, isCount);
+    if (data.length > 0) {
+      bar = { labels: data.map((d) => d.label), values: data.map((d) => d.value), category: catCol, metric: metric || "count" };
+    }
+  }
+  if (entityGroups.length >= 2 && rows.length <= 200) {
+    const net = buildNetworkData(rows, entityGroups, cols, colInfo);
+    if (net.nodes.length >= 2 && net.edges.length > 0) {
+      network = net;
+    }
+  }
+  if (pie) {
+    suggested = "pie";
+    reason = `${pie.labels.length} ${pie.category} groups with ${pie.metric}`;
+  } else if (bar) {
+    suggested = "bar";
+    reason = `${bar.labels.length} ${bar.category} values`;
+  }
+  if (network && (suggested === "table" || (network.nodes.length <= 30 && network.edges.length >= network.nodes.length / 2))) {
+    suggested = "network";
+    reason = `${entityGroups.length} related entities: ${entityGroups.map((g) => g.entity).join(", ")}`;
+  }
+  const insights = generateInsights(table, colInfo, pie, bar, network, entityGroups);
+  return { suggested, reason, pie, bar, network, insights, colInfo, entityGroups };
+}
+
+const CHART_PALETTE = ["#3b82f6", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4", "#84cc16", "#a855f7", "#facc15"];
+
+function renderPieChart(canvas, data, isDark) {
+  const textColor = isDark ? "#e2e8f0" : "#0f172a";
+  const borderColor = isDark ? "#1e293b" : "#ffffff";
+  return new Chart(canvas, {
+    type: "doughnut",
+    data: {
+      labels: data.labels,
+      datasets: [{
+        data: data.values,
+        backgroundColor: data.labels.map((_, i) => CHART_PALETTE[i % CHART_PALETTE.length]),
+        borderColor,
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: "55%",
+      plugins: {
+        legend: { position: "right", labels: { color: textColor, font: { size: 12 }, boxWidth: 12, padding: 8 } },
+        title: { display: true, text: `${data.metric} by ${data.category}`, color: textColor, font: { size: 13, weight: "600" } },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+              const pct = total > 0 ? ((ctx.parsed / total) * 100).toFixed(1) : 0;
+              return `${ctx.label}: ${ctx.parsed} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+function renderBarChart(canvas, data, isDark) {
+  const textColor = isDark ? "#e2e8f0" : "#0f172a";
+  const gridColor = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
+  const horizontal = data.labels.length > 6;
+  const colors = data.labels.map((_, i) => CHART_PALETTE[i % CHART_PALETTE.length]);
+  return new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: data.labels,
+      datasets: [{
+        label: data.metric,
+        data: data.values,
+        backgroundColor: colors,
+        borderColor: colors.map((c) => c),
+        borderWidth: 1,
+        borderRadius: 4,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      indexAxis: horizontal ? "y" : "x",
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: `${data.metric} by ${data.category}`, color: textColor, font: { size: 13, weight: "600" } },
+        tooltip: {},
+      },
+      scales: {
+        x: { ticks: { color: textColor }, grid: { color: gridColor } },
+        y: { ticks: { color: textColor }, grid: { color: gridColor }, beginAtZero: true },
+      },
+    },
+  });
+}
+
+function renderNetworkGraph(container, data, isDark) {
+  container.innerHTML = "";
+  const bgColor = isDark ? "#1e293b" : "#ffffff";
+  container.style.background = bgColor;
+  container.style.height = "400px";
+  const groupColors = {};
+  data.groups.forEach((g, i) => {
+    groupColors[g] = CHART_PALETTE[i % CHART_PALETTE.length];
+  });
+  const nodesArr = data.nodes.map((n) => ({
+    id: n.id,
+    label: n.label,
+    color: {
+      background: groupColors[n.group] || "#94a3b8",
+      border: isDark ? "#0b1220" : "#ffffff",
+      highlight: { background: groupColors[n.group], border: "#fbbf24" },
+    },
+    font: { color: isDark ? "#e2e8f0" : "#0f172a", size: 12, face: "Inter, system-ui, sans-serif" },
+    title: `${n.group}: ${n.label}`,
+    shape: "dot",
+    size: 18,
+    borderWidth: 2,
+  }));
+  const edgesArr = data.edges.map((e, i) => ({
+    id: `e${i}`,
+    from: e.from,
+    to: e.to,
+    color: { color: isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.18)" },
+    smooth: { type: "continuous" },
+  }));
+  const nodes = new vis.DataSet(nodesArr);
+  const edges = new vis.DataSet(edgesArr);
+  return new vis.Network(container, { nodes, edges }, {
+    physics: {
+      enabled: true,
+      stabilization: { iterations: 200, fit: true },
+      barnesHut: { gravitationalConstant: -3500, centralGravity: 0.2, springLength: 120, springConstant: 0.04, damping: 0.5 },
+    },
+    interaction: { hover: true, tooltipDelay: 100, navigationButtons: false, keyboard: false },
+    nodes: { shape: "dot" },
+    edges: { width: 1, smooth: { type: "continuous" } },
+  });
+}
+
+const resultPanels = new Set();
+
+function buildResultPanel(table) {
+  const analysis = analyzeTable(table);
+  const panelEl = document.createElement("div");
+  panelEl.className = "result-panel";
+  const tabsEl = document.createElement("div");
+  tabsEl.className = "result-tabs";
+  const tableTab = document.createElement("button");
+  tableTab.className = "result-tab active";
+  tableTab.dataset.view = "table";
+  tableTab.textContent = "Table";
+  const graphTab = document.createElement("button");
+  graphTab.className = "result-tab";
+  graphTab.dataset.view = "graph";
+  const hasGraph = !!(analysis.pie || analysis.bar || analysis.network);
+  graphTab.textContent = hasGraph ? "Graph" : "Graph (n/a)";
+  graphTab.disabled = !hasGraph;
+  if (!hasGraph) graphTab.title = "No suitable dimensions for visualization";
+  tabsEl.appendChild(tableTab);
+  tabsEl.appendChild(graphTab);
+  panelEl.appendChild(tabsEl);
+  const tableView = document.createElement("div");
+  tableView.className = "result-view result-view-table";
+  const graphView = document.createElement("div");
+  graphView.className = "result-view result-view-graph hidden";
+  const graphTypeTabs = document.createElement("div");
+  graphTypeTabs.className = "graph-type-tabs";
+  const types = [
+    { id: "auto", label: "Auto", enabled: true, available: true },
+    { id: "pie", label: "Pie", enabled: !!analysis.pie, available: !!analysis.pie },
+    { id: "bar", label: "Bar", enabled: !!analysis.bar, available: !!analysis.bar },
+    { id: "network", label: "Network", enabled: !!(analysis.network && analysis.network.nodes.length > 0), available: !!(analysis.network && analysis.network.nodes.length > 0) },
+  ];
+  let activeType = "auto";
+  for (const t of types) {
+    const btn = document.createElement("button");
+    btn.className = "graph-type-tab" + (t.id === "auto" ? " active" : "");
+    btn.dataset.type = t.id;
+    btn.textContent = t.label;
+    btn.disabled = !t.available;
+    btn.title = t.available ? `Switch to ${t.label}` : `${t.label} not available for this data`;
+    graphTypeTabs.appendChild(btn);
+  }
+  graphView.appendChild(graphTypeTabs);
+  const graphInner = document.createElement("div");
+  graphInner.className = "graph-inner";
+  const canvas = document.createElement("canvas");
+  canvas.className = "graph-canvas";
+  const networkEl = document.createElement("div");
+  networkEl.className = "graph-network";
+  graphInner.appendChild(canvas);
+  graphInner.appendChild(networkEl);
+  graphView.appendChild(graphInner);
+  if (analysis.insights && analysis.insights.length) {
+    const insightsEl = document.createElement("div");
+    insightsEl.className = "graph-insights";
+    insightsEl.innerHTML = `<span class="insights-label">Insights:</span> ${analysis.insights.map(escapeHtml).join(" · ")}`;
+    graphView.appendChild(insightsEl);
+  }
+  const reasonEl = document.createElement("div");
+  reasonEl.className = "graph-reason";
+  reasonEl.textContent = `Auto-detected: ${analysis.suggested} — ${analysis.reason}`;
+  graphView.appendChild(reasonEl);
+  panelEl.appendChild(tableView);
+  panelEl.appendChild(graphView);
+  let chartInstance = null;
+  let networkInstance = null;
+  function destroyCharts() {
+    if (chartInstance) {
+      try { chartInstance.destroy(); } catch {}
+      chartInstance = null;
+    }
+    if (networkInstance) {
+      try { networkInstance.destroy(); } catch {}
+      networkInstance = null;
+    }
+    networkEl.innerHTML = "";
+    graphInner.querySelectorAll(".graph-empty").forEach((el) => el.remove());
+  }
+  function getActiveType() {
+    if (activeType === "auto") return analysis.suggested;
+    return activeType;
+  }
+  function renderGraph() {
+    destroyCharts();
+    canvas.style.display = "none";
+    networkEl.style.display = "none";
+    const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+    const type = getActiveType();
+    if (type === "pie" && analysis.pie) {
+      canvas.style.display = "block";
+      try { chartInstance = renderPieChart(canvas, analysis.pie, isDark); } catch (e) { console.error("Pie chart failed", e); }
+    } else if (type === "bar" && analysis.bar) {
+      canvas.style.display = "block";
+      try { chartInstance = renderBarChart(canvas, analysis.bar, isDark); } catch (e) { console.error("Bar chart failed", e); }
+    } else if (type === "network" && analysis.network && analysis.network.nodes.length > 0) {
+      networkEl.style.display = "block";
+      try { networkInstance = renderNetworkGraph(networkEl, analysis.network, isDark); } catch (e) { console.error("Network graph failed", e); }
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "graph-empty";
+      empty.textContent = "This data shape isn't ideal for visualization. Try the table view.";
+      graphInner.appendChild(empty);
+    }
+  }
+  const panelState = { panelEl, renderGraph, destroyCharts };
+  resultPanels.add(panelState);
+  tableTab.addEventListener("click", () => {
+    tableTab.classList.add("active");
+    graphTab.classList.remove("active");
+    tableView.classList.remove("hidden");
+    graphView.classList.add("hidden");
+    destroyCharts();
+  });
+  graphTab.addEventListener("click", () => {
+    if (graphTab.disabled) return;
+    graphTab.classList.add("active");
+    tableTab.classList.remove("active");
+    graphView.classList.remove("hidden");
+    tableView.classList.add("hidden");
+    requestAnimationFrame(() => renderGraph());
+  });
+  graphTypeTabs.addEventListener("click", (e) => {
+    const btn = e.target.closest(".graph-type-tab");
+    if (!btn || btn.disabled) return;
+    graphTypeTabs.querySelectorAll(".graph-type-tab").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    activeType = btn.dataset.type;
+    requestAnimationFrame(() => renderGraph());
+  });
+  return { panelEl, tableView, renderGraph };
+}
+
+function rerenderAllCharts() {
+  for (const p of resultPanels) {
+    const graphView = p.panelEl.querySelector(".result-view-graph");
+    if (graphView && !graphView.classList.contains("hidden")) {
+      try { p.renderGraph(); } catch (e) { console.error("Rerender failed", e); }
+    }
+  }
+}
+
+const themeToggle = $("themeToggle");
+const THEME_KEY = "theme";
+function getStoredTheme() {
+  return localStorage.getItem(THEME_KEY);
+}
+function getSystemTheme() {
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function applyTheme(theme) {
+  const t = theme === "dark" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", t);
+  if (themeToggle) {
+    themeToggle.setAttribute("aria-pressed", t === "dark" ? "true" : "false");
+    themeToggle.title = t === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  }
+}
+function initTheme() {
+  const urlTheme = new URLSearchParams(window.location.search).get("theme");
+  if (urlTheme === "light" || urlTheme === "dark") {
+    return;
+  }
+  const stored = getStoredTheme();
+  applyTheme(stored || getSystemTheme());
+}
+function toggleTheme() {
+  const current = document.documentElement.getAttribute("data-theme") || "light";
+  const next = current === "dark" ? "light" : "dark";
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+}
+if (themeToggle) {
+  themeToggle.addEventListener("click", toggleTheme);
+}
+initTheme();
+if (window.matchMedia) {
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+    const urlTheme = new URLSearchParams(window.location.search).get("theme");
+    if (!getStoredTheme() && !urlTheme) applyTheme(e.matches ? "dark" : "light");
+  });
+}
+const themeObserver = new MutationObserver(() => {
+  setTimeout(rerenderAllCharts, 50);
+});
+themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
 async function send() {
   if (isLoading) return;
   const q = queryInput.value.trim();
@@ -221,7 +764,16 @@ async function send() {
       },
     });
     currentSessionId = resp.session_id;
-    addAssistantBubble(resp.summary, { table: resp.table, tool_calls: resp.tool_calls });
+    addAssistantBubble(resp.summary, {
+      table: resp.table,
+      tool_calls: resp.tool_calls,
+      llm: {
+        provider: resp.llm_provider,
+        latency_ms: resp.llm_latency_ms,
+        tokens: resp.llm_tokens,
+        corrected: (resp.tool_calls || []).some((t) => t.corrected),
+      },
+    });
     loadSessions();
   } catch (e) {
     addAssistantBubble("Error: " + e.message, null);
@@ -250,6 +802,56 @@ roleSelect.addEventListener("change", () => localStorage.setItem("userRole", rol
 const storedRole = localStorage.getItem("userRole");
 if (storedRole) roleSelect.value = storedRole;
 
+const LLM_STORAGE_KEY = "llmOptionId";
+async function loadLlmConfig() {
+  try {
+    const cfg = await api("/llm/config");
+    if (!llmSelect) return;
+    const stored = localStorage.getItem(LLM_STORAGE_KEY);
+    llmSelect.innerHTML = "";
+    cfg.options.forEach((opt) => {
+      const o = document.createElement("option");
+      o.value = opt.id;
+      o.textContent = opt.label + (opt.available ? "" : "  (unavailable)");
+      o.disabled = !opt.available;
+      o.title = opt.available ? opt.label : (opt.reason || "Unavailable");
+      llmSelect.appendChild(o);
+    });
+    const customOpt = document.createElement("option");
+    customOpt.value = "custom";
+    customOpt.textContent = `Custom: ${cfg.current.provider} / ${cfg.current.model}`;
+    customOpt.title = "Currently active custom config";
+    llmSelect.appendChild(customOpt);
+    let chosen = stored && cfg.options.find((o) => o.id === stored && o.available) ? stored : cfg.current.id;
+    if (chosen === "custom" || !cfg.options.find((o) => o.id === chosen)) {
+      customOpt.selected = true;
+    } else {
+      llmSelect.value = chosen;
+    }
+  } catch (e) {
+    console.error("Failed to load LLM config", e);
+    if (llmSelect) {
+      llmSelect.innerHTML = "<option value=''>LLM config unavailable</option>";
+    }
+  }
+}
+if (llmSelect) {
+  llmSelect.addEventListener("change", async () => {
+    const id = llmSelect.value;
+    if (!id) return;
+    try {
+      const r = await api("/llm/config", { method: "POST", body: { id } });
+      localStorage.setItem(LLM_STORAGE_KEY, id);
+      setStatus(true, `LLM → ${r.provider}/${r.model}`);
+      setTimeout(() => checkHealth(), 1500);
+    } catch (e) {
+      alert("Failed to switch LLM: " + e.message);
+      loadLlmConfig();
+    }
+  });
+  loadLlmConfig();
+}
+
 servicesBtn.addEventListener("click", () => {
   servicesModal.classList.remove("hidden");
   loadServices();
@@ -269,9 +871,31 @@ async function loadServices() {
       serviceListEl.appendChild(li);
       return;
     }
+    let health = { services: [] };
+    try {
+      health = await api("/services/health");
+    } catch (e) {
+      console.warn("Health probe failed", e);
+    }
+    const healthById = Object.fromEntries((health.services || []).map((h) => [h.id, h]));
     services.forEach((s) => {
+      const h = healthById[s.id];
+      const status = h ? h.status : "unknown";
+      const latency = h && h.latency_ms != null ? `${h.latency_ms}ms` : "?";
+      const dotClass = `health-dot health-${status}`;
       const li = document.createElement("li");
-      li.innerHTML = `<div><strong>${escapeHtml(s.name)}</strong><div class="url-line">${escapeHtml(s.base_url)}</div><div>${s.entity_sets.map((e) => `<span class="tool-pill">${escapeHtml(e)}</span>`).join("")}</div></div>`;
+      li.innerHTML = `
+        <div>
+          <div class="svc-header">
+            <span class="${dotClass}" title="${status}${h && h.http_status ? ` (HTTP ${h.http_status})` : ""}"></span>
+            <strong>${escapeHtml(s.name)}</strong>
+            <span class="health-label">${escapeHtml(status)} · ${escapeHtml(latency)}</span>
+          </div>
+          <div class="url-line">${escapeHtml(s.base_url)}</div>
+          <div>${s.entity_sets.map((e) => `<span class="tool-pill">${escapeHtml(e)}</span>`).join("")}</div>
+          ${h && h.error ? `<div class="url-line health-error">${escapeHtml(h.error)}</div>` : ""}
+        </div>
+      `;
       const del = document.createElement("button");
       del.className = "delete";
       del.textContent = "Remove";

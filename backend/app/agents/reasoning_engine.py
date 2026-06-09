@@ -25,10 +25,14 @@ It supports three providers:
   - "mock": heuristic intent/entity extraction (always available)
   - "openai": uses the OpenAI chat completions API (requires OPENAI_API_KEY)
   - "gemini": uses Google Gemini via google-genai (requires GEMINI_API_KEY)
+
+plan() returns a tuple: (plan_dict, metadata_dict) where metadata_dict
+contains provider, latency_ms, and tokens_used.
 """
 import json
 import re
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.config import settings
@@ -37,24 +41,72 @@ from app.config import settings
 class LLMReasoningEngine:
     def __init__(self):
         self.provider = settings.llm_provider
+        self.model = settings.llm_model
+        self._lock = None
+
+    def set_config(self, provider: Optional[str] = None, model: Optional[str] = None) -> None:
+        """Update the active LLM provider/model at runtime.
+
+        Both arguments are optional; pass only the one(s) you want to change.
+        """
+        if provider is not None:
+            self.provider = provider
+        if model is not None:
+            self.model = model
+        logger.info(f"LLM config updated: provider={self.provider}, model={self.model}")
+
+    def get_config(self) -> Dict[str, Any]:
+        return {"provider": self.provider, "model": self.model}
 
     async def plan(
         self,
         query: str,
         available_services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if self.provider == "openai" and settings.openai_api_key:
+            t0 = time.perf_counter()
             try:
-                return await self._plan_openai(query, available_services, memory_context)
+                plan, tokens = await self._plan_openai(query, available_services, memory_context)
+                return plan, {"provider": "openai", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
             except Exception as e:
                 logger.warning(f"OpenAI planning failed, falling back to mock: {e}")
         elif self.provider == "gemini" and settings.gemini_api_key:
+            t0 = time.perf_counter()
             try:
-                return await self._plan_gemini(query, available_services, memory_context)
+                plan, tokens = await self._plan_gemini(query, available_services, memory_context)
+                return plan, {"provider": "gemini", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
             except Exception as e:
                 logger.warning(f"Gemini planning failed, falling back to mock: {e}")
-        return self._plan_mock(query, available_services, memory_context)
+        t0 = time.perf_counter()
+        plan = self._plan_mock(query, available_services, memory_context)
+        return plan, {"provider": "mock", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": 0}
+
+    async def correct_plan(
+        self,
+        original_query: str,
+        failed_plan: Dict[str, Any],
+        error_message: str,
+        available_services: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Ask the LLM to fix a plan that failed at the OData layer.
+        Returns (corrected_plan, metadata). Falls back to None on any failure.
+        """
+        if self.provider == "openai" and settings.openai_api_key:
+            t0 = time.perf_counter()
+            try:
+                plan, tokens = await self._correct_openai(original_query, failed_plan, error_message, available_services)
+                return plan, {"provider": "openai", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
+            except Exception as e:
+                logger.warning(f"OpenAI self-correction failed: {e}")
+        elif self.provider == "gemini" and settings.gemini_api_key:
+            t0 = time.perf_counter()
+            try:
+                plan, tokens = await self._correct_gemini(original_query, failed_plan, error_message, available_services)
+                return plan, {"provider": "gemini", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
+            except Exception as e:
+                logger.warning(f"Gemini self-correction failed: {e}")
+        return None, {"provider": "none", "latency_ms": 0, "tokens": 0}
 
     def _plan_mock(
         self,
@@ -314,7 +366,7 @@ class LLMReasoningEngine:
         query: str,
         services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(
@@ -325,7 +377,9 @@ class LLMReasoningEngine:
             "You are an OData query planner. Given a natural language question "
             "and a list of available OData services, output JSON with keys: "
             "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
-            "and summary. Use only services and entity sets provided."
+            "and summary. Use only services and entity sets provided. "
+            "IMPORTANT: Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
+            "Use the foreign key field directly (e.g. 'CategoryID eq 1')."
         )
         user_prompt = json.dumps({
             "query": query,
@@ -341,7 +395,7 @@ class LLMReasoningEngine:
             "memory_context": memory_context or [],
         })
         resp = await client.chat.completions.create(
-            model=settings.llm_model,
+            model=self.model or settings.llm_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -349,27 +403,35 @@ class LLMReasoningEngine:
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content
+        tokens = 0
         try:
-            return json.loads(content)
+            if hasattr(resp, "usage") and resp.usage:
+                tokens = getattr(resp.usage, "total_tokens", 0) or 0
         except Exception:
-            return self._plan_mock(query, services, memory_context)
+            tokens = 0
+        try:
+            return json.loads(content), tokens
+        except Exception:
+            return self._plan_mock(query, services, memory_context), tokens
 
     async def _plan_gemini(
         self,
         query: str,
         services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], int]:
         from google import genai
         from google.genai import types
 
         client = genai.Client(api_key=settings.gemini_api_key)
-        model = settings.llm_model or "gemini-2.0-flash"
+        model = self.model or settings.llm_model or "gemini-2.0-flash"
         system_prompt = (
             "You are an OData query planner. Given a natural language question "
             "and a list of available OData services, output JSON with keys: "
             "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
-            "and summary. Use only services and entity sets provided."
+            "and summary. Use only services and entity sets provided. "
+            "IMPORTANT: Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
+            "Use the foreign key field directly (e.g. 'CategoryID eq 1')."
         )
         user_prompt = json.dumps({
             "query": query,
@@ -393,10 +455,113 @@ class LLMReasoningEngine:
             ),
         )
         content = resp.text or ""
+        tokens = 0
         try:
-            return json.loads(content)
+            if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                tokens = getattr(resp.usage_metadata, "total_token_count", 0) or 0
         except Exception:
-            return self._plan_mock(query, services, memory_context)
+            tokens = 0
+        try:
+            return json.loads(content), tokens
+        except Exception:
+            return self._plan_mock(query, services, memory_context), tokens
+
+    async def _correct_openai(
+        self,
+        original_query: str,
+        failed_plan: Dict[str, Any],
+        error_message: str,
+        services: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], int]:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url or None,
+        )
+        system_prompt = (
+            "You are an OData query fixer. The previous plan failed at the OData layer. "
+            "Diagnose the error and produce a corrected JSON plan. "
+            "Rules: do NOT use navigation properties in $filter (use the FK field); "
+            "use only valid OData v4 operators (eq, ne, gt, lt, ge, le, and, or, not, contains, startswith); "
+            "use only entity sets and properties that exist in the listed services."
+        )
+        user_prompt = json.dumps({
+            "original_query": original_query,
+            "failed_plan": failed_plan,
+            "error": error_message,
+            "services": [
+                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", [])}
+                for s in services
+            ],
+        })
+        resp = await client.chat.completions.create(
+            model=self.model or settings.llm_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content
+        tokens = 0
+        try:
+            if hasattr(resp, "usage") and resp.usage:
+                tokens = getattr(resp.usage, "total_tokens", 0) or 0
+        except Exception:
+            tokens = 0
+        try:
+            return json.loads(content), tokens
+        except Exception:
+            return None, tokens
+
+    async def _correct_gemini(
+        self,
+        original_query: str,
+        failed_plan: Dict[str, Any],
+        error_message: str,
+        services: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], int]:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=settings.gemini_api_key)
+        model = self.model or settings.llm_model or "gemini-2.0-flash"
+        system_prompt = (
+            "You are an OData query fixer. The previous plan failed at the OData layer. "
+            "Diagnose the error and produce a corrected JSON plan. "
+            "Rules: do NOT use navigation properties in $filter (use the FK field); "
+            "use only valid OData v4 operators (eq, ne, gt, lt, ge, le, and, or, not, contains, startswith); "
+            "use only entity sets and properties that exist in the listed services."
+        )
+        user_prompt = json.dumps({
+            "original_query": original_query,
+            "failed_plan": failed_plan,
+            "error": error_message,
+            "services": [
+                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", [])}
+                for s in services
+            ],
+        })
+        resp = await client.aio.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+            ),
+        )
+        content = resp.text or ""
+        tokens = 0
+        try:
+            if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                tokens = getattr(resp.usage_metadata, "total_token_count", 0) or 0
+        except Exception:
+            tokens = 0
+        try:
+            return json.loads(content), tokens
+        except Exception:
+            return None, tokens
 
 
 llm_engine = LLMReasoningEngine()

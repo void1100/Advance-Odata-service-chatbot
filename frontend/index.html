@@ -4,7 +4,18 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OData Orchestration Chat</title>
+  <script>
+    (function() {
+      try {
+        var urlTheme = new URLSearchParams(window.location.search).get("theme"); var stored = urlTheme || localStorage.getItem("theme");
+        var theme = stored || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.setAttribute("data-theme", theme);
+      } catch (e) {}
+    })();
+  </script>
   <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
 </head>
 <body>
   <div id="app">
@@ -23,6 +34,11 @@
             <option>Viewer</option>
           </select>
         </label>
+        <label>LLM:
+          <select id="llmSelect" title="Switch LLM model">
+            <option value="">Loading...</option>
+          </select>
+        </label>
         <div class="status-line">
           <span id="statusDot" class="dot"></span>
           <span id="statusText">checking...</span>
@@ -34,6 +50,10 @@
       <header class="topbar">
         <h1>Advanced OData Service Orchestration</h1>
         <div class="topbar-actions">
+          <button id="themeToggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">
+            <span class="theme-icon-light">☀</span>
+            <span class="theme-icon-dark">☾</span>
+          </button>
           <button id="servicesBtn">Services</button>
         </div>
       </header>
@@ -71,3 +91,4 @@
   <script src="./app.js"></script>
 </body>
 </html>
+

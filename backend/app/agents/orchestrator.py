@@ -2,7 +2,8 @@
 execution, and memory.
 """
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import httpx
 from loguru import logger
 
 from app.agents.discovery_agent import discovery_agent
@@ -10,6 +11,9 @@ from app.agents.reasoning_engine import llm_engine
 from app.agents.policy_engine import policy_engine
 from app.db.vector_store import vector_store
 from app.services.service_manager import service_manager
+
+
+TOP_SAFETY_CAP = 200
 
 
 def _to_list(value):
@@ -26,7 +30,21 @@ def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     if not plan:
         return plan
     normalized = dict(plan)
+    intent = normalized.get("intent")
+    if not isinstance(intent, str):
+        normalized["intent"] = str(intent) if intent is not None else "unknown"
+    summary = normalized.get("summary")
+    if not isinstance(summary, str):
+        normalized["summary"] = str(summary) if summary is not None else ""
+    ts = normalized.get("target_services")
+    if not isinstance(ts, list):
+        if isinstance(ts, str):
+            normalized["target_services"] = [s.strip() for s in ts.split(",") if s.strip()]
+        else:
+            normalized["target_services"] = []
     steps = normalized.get("steps") or []
+    if not isinstance(steps, list):
+        steps = []
     new_steps = []
     for step in steps:
         s = dict(step)
@@ -35,18 +53,54 @@ def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         ob = s.get("orderby")
         if isinstance(ob, list):
             s["orderby"] = ", ".join(str(x) for x in ob if x) if ob else None
+        elif ob is not None and not isinstance(ob, str):
+            s["orderby"] = str(ob)
+        for str_field in ("service_id", "entity_set", "filter"):
+            v = s.get(str_field)
+            if v is not None and not isinstance(v, str):
+                s[str_field] = str(v)
         for int_field in ("top", "skip"):
             v = s.get(int_field)
             if v == "" or v is None:
                 s[int_field] = None
-            elif isinstance(v, str):
+            elif isinstance(v, bool):
+                s[int_field] = None
+            elif isinstance(v, (int, float)):
                 try:
                     s[int_field] = int(v)
+                except (TypeError, ValueError, OverflowError):
+                    s[int_field] = None
+            elif isinstance(v, str):
+                try:
+                    s[int_field] = int(v.strip())
                 except (TypeError, ValueError):
                     s[int_field] = None
+            else:
+                s[int_field] = None
         new_steps.append(s)
     normalized["steps"] = new_steps
     return normalized
+
+
+def _apply_safety_caps(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure every step has a $top cap to prevent accidental huge responses."""
+    if not plan:
+        return plan
+    for step in plan.get("steps", []):
+        if step.get("top") is None:
+            step["top"] = TOP_SAFETY_CAP
+        elif isinstance(step.get("top"), int) and step["top"] > TOP_SAFETY_CAP:
+            step["top"] = TOP_SAFETY_CAP
+    return plan
+
+
+def _is_retryable_odata_error(exc: Exception) -> bool:
+    """We only self-correct on client (4xx) and server (5xx) errors that
+    look like bad planning, not on connection failures or auth issues."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code in (400, 404, 500, 501, 502, 503)
+    return False
 
 
 class Orchestrator:
@@ -75,11 +129,18 @@ class Orchestrator:
                 "table": None,
                 "summary": "No services available.",
                 "memory_used": memory,
+                "llm_provider": "n/a",
+                "llm_latency_ms": 0,
+                "llm_tokens": 0,
             }
 
         discovery = await discovery_agent.discover(user_query)
-        plan = await llm_engine.plan(user_query, services, memory_context=memory)
+        plan, llm_meta = await llm_engine.plan(user_query, services, memory_context=memory)
         plan = _normalize_plan(plan)
+        plan = _apply_safety_caps(plan)
+        llm_provider = llm_meta.get("provider", "unknown")
+        llm_latency_ms = llm_meta.get("latency_ms", 0)
+        llm_tokens = llm_meta.get("tokens", 0)
 
         tool_calls: List[Dict[str, Any]] = []
         execution_results: List[Dict[str, Any]] = []
@@ -88,8 +149,9 @@ class Orchestrator:
         primary_url = None
         primary_service = None
         error_message: Optional[str] = None
+        corrected_step_indices: List[int] = []
 
-        for step in plan.get("steps", []):
+        for idx, step in enumerate(plan.get("steps", [])):
             sid = step.get("service_id")
             ent = step.get("entity_set")
             check = policy_engine.can_execute(user_role, sid, ent, step)
@@ -109,6 +171,7 @@ class Orchestrator:
                     "entity_set": ent,
                     "url": res["url"],
                     "row_count": res["table"]["row_count"],
+                    "corrected": idx in corrected_step_indices,
                 })
                 execution_results.append(res)
                 if primary_table is None:
@@ -116,6 +179,54 @@ class Orchestrator:
                     primary_url = res["url"]
                     primary_service = sid
             except Exception as e:
+                if _is_retryable_odata_error(e) and not (idx in corrected_step_indices):
+                    corrected_plan, corr_meta = await llm_engine.correct_plan(
+                        original_query=user_query,
+                        failed_plan=plan,
+                        error_message=str(e),
+                        available_services=services,
+                    )
+                    llm_tokens += corr_meta.get("tokens", 0)
+                    llm_latency_ms += corr_meta.get("latency_ms", 0)
+                    if corrected_plan and corrected_plan.get("steps"):
+                        normalized_corrected = _normalize_plan(corrected_plan)
+                        normalized_corrected = _apply_safety_caps(normalized_corrected)
+                        replacement_step = normalized_corrected["steps"][0]
+                        replacement_step = {**step, **replacement_step}
+                        try:
+                            role = policy_engine.get_role(user_role)
+                            res2 = await service_manager.execute_plan(
+                                service_id=replacement_step.get("service_id") or sid,
+                                plan=replacement_step,
+                                allowed_ops=role.get("allowed_ops"),
+                            )
+                            tool_calls.append({
+                                "type": "odata.query",
+                                "service_id": replacement_step.get("service_id") or sid,
+                                "entity_set": replacement_step.get("entity_set") or ent,
+                                "url": res2["url"],
+                                "row_count": res2["table"]["row_count"],
+                                "corrected": True,
+                            })
+                            execution_results.append(res2)
+                            if primary_table is None:
+                                primary_table = res2["table"]
+                                primary_url = res2["url"]
+                                primary_service = replacement_step.get("service_id") or sid
+                            plan["steps"][idx] = replacement_step
+                            corrected_step_indices.append(idx)
+                            continue
+                        except Exception as e2:
+                            logger.warning(f"Self-correction retry failed: {e2}")
+                            error_message = f"Step failed for service '{sid}' entity '{ent}': {e} (self-correction also failed: {e2})"
+                            tool_calls.append({
+                                "type": "odata.error",
+                                "service_id": sid,
+                                "entity_set": ent,
+                                "error": str(e),
+                                "correction_error": str(e2),
+                            })
+                            continue
                 logger.exception("Step execution failed")
                 error_message = f"Step failed for service '{sid}' entity '{ent}': {e}"
                 tool_calls.append({
@@ -152,7 +263,7 @@ class Orchestrator:
             "user_query": user_query,
             "user_role": user_role,
             "discovery": discovery,
-            "plan": plan,
+            "plan": _normalize_plan(plan),
             "tool_calls": tool_calls,
             "execution": execution_results,
             "blocked_steps": blocked_steps,
@@ -162,6 +273,9 @@ class Orchestrator:
             "summary": summary,
             "error": error_message,
             "memory_used": memory,
+            "llm_provider": llm_provider,
+            "llm_latency_ms": llm_latency_ms,
+            "llm_tokens": llm_tokens,
         }
 
 

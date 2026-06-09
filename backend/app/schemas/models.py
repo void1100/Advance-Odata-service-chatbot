@@ -75,6 +75,9 @@ class ChatResponse(BaseModel):
     primary_service: Optional[str] = None
     error: Optional[str] = None
     memory_used: List[Dict[str, Any]] = []
+    llm_provider: str = "unknown"
+    llm_latency_ms: int = 0
+    llm_tokens: int = 0
 
 
 class SessionCreate(BaseModel):
