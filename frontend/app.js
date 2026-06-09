@@ -558,6 +558,81 @@ function renderNetworkGraph(container, data, isDark) {
 
 const resultPanels = new Set();
 
+function renderAnalyzeResults(result) {
+  if (result.error) return `<div class="analyze-error">${escapeHtml(result.error)}</div>`;
+  let html = `<div class="analyze-header"><span class="analyze-badge">${result.row_count} rows</span> <span class="analyze-badge">${result.numeric_columns.length} numeric</span> <span class="analyze-badge">${Object.keys(result.algorithms).length} algorithms</span></div>`;
+  html += `<div class="analyze-summary">${escapeHtml(result.summary || "")}</div>`;
+  const algos = result.algorithms;
+  if (algos.summary_statistics && algos.summary_statistics.columns) {
+    html += `<div class="analyze-card"><div class="analyze-card-title">Summary Statistics</div><div class="analyze-card-desc">${escapeHtml(algos.summary_statistics.description)}</div>`;
+    html += `<div class="analyze-table-wrap"><table class="analyze-table"><thead><tr><th>Column</th><th>Count</th><th>Mean</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Q1</th><th>Q3</th><th>Skew</th></tr></thead><tbody>`;
+    for (const [col, s] of Object.entries(algos.summary_statistics.columns)) {
+      html += `<tr><td><strong>${escapeHtml(col)}</strong></td><td>${s.count}</td><td>${s.mean}</td><td>${s.median}</td><td>${s.std}</td><td>${s.min}</td><td>${s.max}</td><td>${s.q1}</td><td>${s.q3}</td><td>${s.skewness}</td></tr>`;
+    }
+    html += `</tbody></table></div></div>`;
+  }
+  if (algos.anomaly_detection) {
+    const ad = algos.anomaly_detection;
+    html += `<div class="analyze-card"><div class="analyze-card-title">Anomaly Detection</div><div class="analyze-card-desc">${escapeHtml(ad.description)} — Method: ${escapeHtml(ad.method)} (threshold: ${ad.threshold})</div>`;
+    html += `<div class="analyze-stat">Found <strong>${ad.anomaly_count}</strong> anomalous row${ad.anomaly_count === 1 ? "" : "s"}</div>`;
+    if (ad.anomalies && ad.anomalies.length > 0) {
+      html += `<div class="analyze-table-wrap"><table class="analyze-table"><thead><tr><th>Row #</th><th>Column</th><th>Value</th><th>Z-Score</th></tr></thead><tbody>`;
+      for (const a of ad.anomalies) {
+        const entries = Object.entries(a.deviations);
+        for (let i = 0; i < entries.length; i++) {
+          const [col, dev] = entries[i];
+          const rowSpan = i === 0 ? ` rowspan="${entries.length}"` : "";
+          if (i === 0) html += `<tr><td${rowSpan}><strong>${a.row_index}</strong></td>`;
+          html += `<td>${escapeHtml(col)}</td><td>${dev.value}</td><td class="z-score">${dev.z_score}</td></tr>`;
+        }
+      }
+      html += `</tbody></table></div>`;
+    }
+    html += `</div>`;
+  }
+  if (algos.correlation_analysis) {
+    const ca = algos.correlation_analysis;
+    html += `<div class="analyze-card"><div class="analyze-card-title">Correlation Analysis</div><div class="analyze-card-desc">${escapeHtml(ca.description)} — Method: ${escapeHtml(ca.method)}</div>`;
+    if (ca.top_pairs && ca.top_pairs.length > 0) {
+      html += `<div class="analyze-table-wrap"><table class="analyze-table"><thead><tr><th>Column A</th><th>Column B</th><th>Correlation</th><th>Strength</th></tr></thead><tbody>`;
+      for (const p of ca.top_pairs) {
+        const cls = p.correlation > 0.7 ? "corr-strong-pos" : p.correlation > 0.4 ? "corr-mod-pos" : p.correlation < -0.7 ? "corr-strong-neg" : p.correlation < -0.4 ? "corr-mod-neg" : "";
+        html += `<tr><td>${escapeHtml(p.column_a)}</td><td>${escapeHtml(p.column_b)}</td><td class="${cls}">${p.correlation}</td><td>${escapeHtml(p.strength)}</td></tr>`;
+      }
+      html += `</tbody></table></div>`;
+    }
+    html += `</div>`;
+  }
+  if (algos.clustering) {
+    const cl = algos.clustering;
+    html += `<div class="analyze-card"><div class="analyze-card-title">K-Means Clustering</div><div class="analyze-card-desc">${escapeHtml(cl.description)} — Method: ${escapeHtml(cl.method)}</div>`;
+    html += `<div class="analyze-stat">K = ${cl.k} clusters</div>`;
+    for (const [name, c] of Object.entries(cl.clusters)) {
+      html += `<div class="cluster-block"><div class="cluster-title">${escapeHtml(name)} <span class="cluster-size">(${c.size} rows)</span></div>`;
+      html += `<div class="cluster-centroid">Centroid: ${Object.entries(c.centroid).map(([k, v]) => `${escapeHtml(k)}: ${v}`).join(", ")}</div>`;
+      if (c.sample_rows && c.sample_rows.length > 0) {
+        html += `<div class="cluster-samples">Samples: ${c.sample_rows.map((r) => JSON.stringify(r)).join(" · ")}</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+  if (algos.feature_importance) {
+    const fi = algos.feature_importance;
+    html += `<div class="analyze-card"><div class="analyze-card-title">Feature Importance</div><div class="analyze-card-desc">${escapeHtml(fi.description)}</div>`;
+    html += `<div class="analyze-table-wrap"><table class="analyze-table"><thead><tr><th>Column</th><th>Importance</th><th>Bar</th></tr></thead><tbody>`;
+    const maxImp = Math.max(...Object.values(fi.importance));
+    for (const [col, imp] of Object.entries(fi.importance)) {
+      const pct = maxImp > 0 ? (imp / maxImp) * 100 : 0;
+      html += `<tr><td>${escapeHtml(col)}</td><td>${imp}</td><td><div class="importance-bar"><div class="importance-fill" style="width:${pct}%"></div></div></td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+    html += `<div class="analyze-stat">Distribution: mean distance = ${fi.distribution.mean_distance}, std = ${fi.distribution.std_distance}</div>`;
+    html += `</div>`;
+  }
+  return html;
+}
+
 function buildResultPanel(table) {
   const analysis = analyzeTable(table);
   const panelEl = document.createElement("div");
@@ -575,8 +650,14 @@ function buildResultPanel(table) {
   graphTab.textContent = hasGraph ? "Graph" : "Graph (n/a)";
   graphTab.disabled = !hasGraph;
   if (!hasGraph) graphTab.title = "No suitable dimensions for visualization";
+  const analyzeTab = document.createElement("button");
+  analyzeTab.className = "result-tab";
+  analyzeTab.dataset.view = "analyze";
+  analyzeTab.textContent = "Analyze";
+  analyzeTab.title = "Run ML analysis on this data";
   tabsEl.appendChild(tableTab);
   tabsEl.appendChild(graphTab);
+  tabsEl.appendChild(analyzeTab);
   panelEl.appendChild(tabsEl);
   const tableView = document.createElement("div");
   tableView.className = "result-view result-view-table";
@@ -622,6 +703,11 @@ function buildResultPanel(table) {
   graphView.appendChild(reasonEl);
   panelEl.appendChild(tableView);
   panelEl.appendChild(graphView);
+
+  const analyzeView = document.createElement("div");
+  analyzeView.className = "result-view result-view-analyze hidden";
+  analyzeView.innerHTML = `<div class="analyze-loading">Click "Analyze" to run ML algorithms on this data...</div>`;
+  panelEl.appendChild(analyzeView);
   let chartInstance = null;
   let networkInstance = null;
   function destroyCharts() {
@@ -686,6 +772,28 @@ function buildResultPanel(table) {
     btn.classList.add("active");
     activeType = btn.dataset.type;
     requestAnimationFrame(() => renderGraph());
+  });
+  let analyzeLoading = false;
+  analyzeTab.addEventListener("click", () => {
+    analyzeTab.classList.add("active");
+    tableTab.classList.remove("active");
+    graphTab.classList.remove("active");
+    analyzeView.classList.remove("hidden");
+    tableView.classList.add("hidden");
+    graphView.classList.add("hidden");
+    if (!analyzeLoading && !analyzeView.dataset.loaded) {
+      analyzeLoading = true;
+      analyzeView.innerHTML = `<div class="analyze-loading">Running ML analysis...</div>`;
+      api("/analyze", { method: "POST", body: { table } })
+        .then((result) => {
+          analyzeView.dataset.loaded = "1";
+          analyzeView.innerHTML = renderAnalyzeResults(result);
+        })
+        .catch((e) => {
+          analyzeView.innerHTML = `<div class="analyze-error">Analysis failed: ${escapeHtml(e.message)}</div>`;
+        })
+        .finally(() => { analyzeLoading = false; });
+    }
   });
   return { panelEl, tableView, renderGraph };
 }

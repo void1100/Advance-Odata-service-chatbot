@@ -18,6 +18,7 @@ This brings up:
 - **Backend** (FastAPI) at `http://localhost:8000` (docs at `/docs`)
 - **Neo4j** graph DB at `bolt://localhost:7687` (browser at `http://localhost:7474`)
 - **Sample OData service** at `http://localhost:5000`
+- **n8n** workflow automation at `http://localhost:5678` (admin/admin)
 - A one-shot **seeder** that registers the Northwind and sample OData services
 
 After the first build, services (including Northwind) are auto-registered.
@@ -35,10 +36,32 @@ To wipe all data (including Neo4j):
 docker compose down -v
 ```
 
-To use the real OpenAI LLM instead of the mock planner, set `OPENAI_API_KEY`:
+## LLM Providers
+
+The system supports multiple LLM providers. Set your preferred provider via
+the UI dropdown or the API:
+
+| Provider | Model | Free Tier |
+|----------|-------|-----------|
+| Groq | llama-3.3-70b-versatile | 14,400 RPD, 30 RPM |
+| Gemini | gemini-2.0-flash | 15 RPM, 1500 RPD |
+| OpenAI | gpt-4o-mini | Pay-per-use |
+| Mock | Deterministic planner | Unlimited |
+
 ```bash
+# Set Groq (recommended for free usage)
+GROQ_API_KEY=gsk_... docker compose up -d
+
+# Set Gemini
+GEMINI_API_KEY=AIza... docker compose up -d
+
+# Set OpenAI
 OPENAI_API_KEY=sk-... docker compose up -d
 ```
+
+Free API keys:
+- Groq: https://console.groq.com/keys
+- Gemini: https://aistudio.google.com/apikey
 
 ### Sample queries to try in the chat
 
@@ -51,7 +74,50 @@ Show top 5 most expensive products
 Show customers with their orders
 ```
 
-## Architecture (matching the diagram)
+## Features
+
+### Chat Interface
+- Natural language input with chat history
+- Tabular results with sorting
+- CSV export
+- Session management (create, rename, delete)
+- Vector memory for context from prior conversations
+
+### Chart Visualization
+Results are displayed with **Table | Graph** tabs:
+- **Table**: Full data table with OData metadata columns filtered out
+- **Graph**: Auto-detects best visualization from data shape
+  - **Pie Chart**: Categorical data with 2-8 unique values
+  - **Bar Chart**: Numerical comparisons (auto-rotates horizontal for 6+ labels)
+  - **Network Graph**: Entity relationships (hub-and-spoke with force-directed layout)
+- Sub-tabs (Auto/Pie/Bar/Network) for manual override
+- Insights panel with reasoning and observations
+
+### ML Analysis
+Click the **Analyze** tab to run ML algorithms on query results:
+- **Summary Statistics**: Mean, median, std, min/max for numeric columns
+- **Anomaly Detection**: Z-score analysis (rows with z > 2 flagged)
+- **Correlation Analysis**: Pearson correlation between numeric columns
+- **K-Means Clustering**: Groups similar rows (k=2 or k=3)
+- **Feature Importance**: Ranks columns by variance contribution
+
+### Dark Mode
+- Toggle via sun/moon button in header
+- Persists across sessions
+- Auto-detects system preference
+- URL param: `?theme=dark`
+
+### Service Health
+- Health badges for all registered services
+- Status: healthy (green), degraded (yellow), down (red)
+- Latency measurement for each service
+
+### LLM Model Switcher
+- Runtime switching between 9 LLM options
+- Persisted in localStorage
+- Badge shows active provider (openai/groq/gemini/mock)
+
+## Architecture
 
 ```
         Problem & Input                Orchestration Layer                  Service Execution Layer
@@ -76,7 +142,7 @@ project_root/
 │   │   ├── db/                    # neo4j, chroma, sqlite, in-memory graph
 │   │   ├── mcp/                   # MCP tool server
 │   │   ├── schemas/               # Pydantic models
-│   │   ├── services/              # OData client, builder, sanitizer, manager
+│   │   ├── services/              # OData client, builder, sanitizer, manager, ML engine
 │   │   ├── config.py
 │   │   └── main.py
 │   ├── scripts/seed_sample_service.py
@@ -84,129 +150,28 @@ project_root/
 │   ├── .env.example
 │   └── run.py
 ├── frontend/                      # Static HTML/CSS/JS chat UI
-│   ├── index.html
-│   ├── styles.css
-│   └── app.js
+│   ├── index.html                 # Theme toggle, LLM selector, CDN scripts
+│   ├── styles.css                 # Dark mode, result panels, chart styles
+│   └── app.js                     # Chart renderers, ML analysis, data analyzer
 ├── sample_odata_service/          # A tiny local OData v4 service for testing
 │   ├── app.py
 │   └── requirements.txt
+├── docker-compose.yml             # 5 services: frontend, backend, neo4j, sample-odata, n8n
 └── README.md
 ```
 
-## Prerequisites
-
-- Python 3.10+
-- (Optional) Neo4j 5.x running on `bolt://localhost:7687`. The backend will
-  fall back to an in-memory graph if Neo4j is unavailable.
-- (Optional) OpenAI API key in `backend/.env` for the OpenAI LLM provider.
-  By default, the system uses a deterministic **mock LLM** that does not
-  require any external service.
-
-## 1. Backend setup
-
-```bash
-cd backend
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS / Linux
-pip install -r requirements.txt
-copy .env.example .env          # Windows
-# cp .env.example .env          # macOS / Linux
-```
-
-Run the backend:
-
-```bash
-python run.py
-```
-
-The API is available at `http://localhost:8000`. OpenAPI docs at `/docs`.
-
-## 2. Start the local sample OData service (recommended for offline testing)
-
-```bash
-cd ../sample_odata_service
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn app:app --port 5000 --reload
-```
-
-This exposes a minimal OData v4 service at
-`http://localhost:5000` with entity sets `Customers`, `Orders`, and `Products`.
-
-## 3. Register services and seed the system
-
-In a separate terminal:
-
-```bash
-cd backend
-.venv\Scripts\activate
-python -m scripts.seed_sample_service
-```
-
-This registers the public Northwind OData v4 service. The seed script
-discovers **26 entity sets** (Customers, Orders, Products, Categories,
-Suppliers, Employees, Shippers, etc.) and indexes them into the graph DB and
-vector store. The system is verified end-to-end against Northwind - see
-`scripts/smoke_test_northwind.py` for a smoke test.
-
-You can also register additional services via the frontend's **Services**
-button or the API:
-
-```bash
-curl -X POST http://localhost:8000/services \
-  -H "Content-Type: application/json" \
-  -d '{"id":"sample","name":"Sample","base_url":"http://localhost:5000","description":"Local OData sample"}'
-```
-
-## 4. Run the frontend
-
-The frontend is a static page. You can either:
-
-**a) Open the file directly:**
-Open `frontend/index.html` in your browser. Then click the gear icon (not
-shown, use the **Services** button) and ensure the API base is
-`http://localhost:8000`. You can change this in the browser console:
-
-```js
-localStorage.setItem("apiBase", "http://localhost:8000");
-```
-
-**b) Serve it locally (recommended, avoids CORS issues):**
-```bash
-cd frontend
-python -m http.server 3000
-```
-
-Open `http://localhost:3000` in your browser.
-
-## 5. Try it
-
-Example natural-language queries (verified against the Northwind OData
-service):
-
-- `Show top 5 customers from Germany`
-- `List all products in Beverages category`
-- `Show top 10 orders with status Shipped`
-- `How many customers are in France?`
-- `Show top 5 most expensive products`
-- `Show customers with their orders`
-
-Each response is rendered as a table, and the orchestrator exposes the OData
-URL it called plus the tool calls it made. The chat history is stored in
-SQLite; relevant prior turns are recalled via vector memory (ChromaDB) for
-context.
-
-## API surface
+## API Surface
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/services` | GET / POST | List / register OData services |
 | `/services/{id}` | DELETE | Remove a service |
 | `/services/{id}/refresh` | POST | Re-fetch metadata |
+| `/services/health` | GET | Health check all services |
 | `/roles` | GET | List role policies |
 | `/chat` | POST | Natural-language query endpoint |
+| `/analyze` | POST | Run ML analysis on table data |
+| `/llm/config` | GET / POST | Get/set LLM provider and model |
 | `/sessions` | GET / POST | Chat sessions |
 | `/sessions/{id}` | PATCH / DELETE | Rename / delete a session |
 | `/sessions/{id}/messages` | GET | Message history |

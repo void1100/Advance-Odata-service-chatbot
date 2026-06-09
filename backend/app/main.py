@@ -351,6 +351,20 @@ async def get_session_messages(session_id: str):
     return [MessageInfo(**m) for m in get_messages(session_id)]
 
 
+@app.post("/analyze")
+async def analyze_table(payload: Dict[str, Any]):
+    table = payload.get("table")
+    if not table or not table.get("rows"):
+        raise HTTPException(status_code=400, detail="No table data to analyze")
+    from app.services.ml_engine import analyze_table as ml_analyze
+    try:
+        result = ml_analyze(table)
+        return result
+    except Exception as e:
+        logger.error(f"ML analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
 @app.get("/mcp/tools")
 async def mcp_tools():
     return {"tools": mcp_server.tools}
