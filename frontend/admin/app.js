@@ -76,6 +76,10 @@ function toggleTheme() {
 
 // --- Navigation ---
 function navigateTo(page) {
+  const allowed = ROLE_PERMISSIONS[currentUser?.role] || ["dashboard"];
+  if (!allowed.includes(page)) {
+    page = allowed[0] || "dashboard";
+  }
   currentPage = page;
   document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
   document.querySelector(`[data-page="${page}"]`)?.classList.add("active");
@@ -592,11 +596,28 @@ async function init() {
   if (await checkAuth()) showAdmin();
 }
 
+const ROLE_PERMISSIONS = {
+  super_admin: ["dashboard", "users", "roles", "services", "analytics", "audit", "settings"],
+  admin: ["dashboard", "users", "roles", "services", "analytics", "audit", "settings"],
+  analyst: ["dashboard", "analytics", "services"],
+  user: ["dashboard"],
+  viewer: ["dashboard"],
+};
+
 function showAdmin() {
   document.getElementById("loginScreen").classList.add("hidden");
   document.getElementById("adminShell").classList.remove("hidden");
   document.getElementById("userInfo").textContent = `${currentUser.username} (${currentUser.role})`;
-  navigateTo("dashboard");
+  const allowed = ROLE_PERMISSIONS[currentUser.role] || ["dashboard"];
+  document.querySelectorAll(".nav-item[data-page]").forEach(el => {
+    const page = el.dataset.page;
+    if (allowed.includes(page)) {
+      el.style.display = "";
+    } else {
+      el.style.display = "none";
+    }
+  });
+  navigateTo(allowed.includes("dashboard") ? "dashboard" : allowed[0]);
 }
 
 function toggleSidebar() {

@@ -4,7 +4,7 @@ Admin routes - Auth, User Management, Dashboard.
 import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, Request, HTTPException, Response, Query
+from fastapi import APIRouter, Request, HTTPException, Response, Query, Depends
 from pydantic import BaseModel, EmailStr
 
 from app.auth import (
@@ -17,6 +17,27 @@ from app.auth.db import get_auth_db
 from app.schemas.models import ServiceRegister
 
 router = APIRouter()
+
+ROLE_PERMISSIONS = {
+    "super_admin": {"dashboard", "users", "roles", "services", "analytics", "audit", "settings"},
+    "admin": {"dashboard", "users", "roles", "services", "analytics", "audit", "settings"},
+    "analyst": {"dashboard", "analytics", "services"},
+    "user": {"dashboard"},
+    "viewer": {"dashboard"},
+}
+
+def require_permission(permission: str):
+    async def check(request: Request):
+        user = get_current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        role = user.get("role", "viewer")
+        allowed = ROLE_PERMISSIONS.get(role, {"dashboard"})
+        if permission not in allowed:
+            raise HTTPException(status_code=403, detail=f"Role '{role}' cannot access '{permission}'")
+        request.state.user = user
+        return user
+    return check
 
 
 # --- Request/Response Models ---
@@ -61,7 +82,6 @@ async def login(body: LoginRequest, request: Request, response: Response):
         db.log_audit(action="login", resource="auth", details=f"Failed login for {body.username}", ip_address=request.client.host, status="failure")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Check account status
     if user["status"] == "disabled":
         raise HTTPException(status_code=403, detail="Account is disabled")
     if user["status"] == "locked":
@@ -73,7 +93,6 @@ async def login(body: LoginRequest, request: Request, response: Response):
                 db.update_user(user["id"], status="active", failed_attempts=0, locked_until=None)
                 user["status"] = "active"
 
-    # Verify password
     if not verify_password(body.password, user["password_hash"]):
         attempts = user["failed_attempts"] + 1
         updates = {"failed_attempts": attempts}
@@ -85,15 +104,12 @@ async def login(body: LoginRequest, request: Request, response: Response):
         db.log_audit(user_id=user["id"], username=user["username"], action="login", resource="auth", details="Invalid password", ip_address=request.client.host, status="failure")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Reset failed attempts on success
     db.update_user(user["id"], failed_attempts=0, locked_until=None, last_login=datetime.now(timezone.utc).isoformat())
 
-    # Create tokens
     token_data = {"sub": user["username"], "user_id": user["id"], "role": user["role"], "email": user["email"]}
     access_token = create_access_token(token_data)
     refresh_token = create_refresh_token(token_data)
 
-    # Set cookie
     response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="strict", max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
 
     db.log_audit(user_id=user["id"], username=user["username"], action="login", resource="auth", ip_address=request.client.host, status="success")
@@ -143,32 +159,20 @@ async def refresh_token(request: Request):
 # --- User Management ---
 
 @router.get("/admin/users")
-async def list_users(request: Request, role: str = None, status: str = None, search: str = None):
-    user = get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if not require_role("super_admin", "admin")(lambda r: None):
-        if user.get("role") not in ("super_admin", "admin"):
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
+async def list_users(request: Request, user=Depends(require_permission("users")), role: str = None, status: str = None, search: str = None):
     db = get_auth_db()
     users = db.list_users(role=role, status=status, search=search)
     return [{k: v for k, v in u.items() if k != "password_hash"} for u in users]
 
 
 @router.post("/admin/users")
-async def create_user(request: Request, body: UserCreate):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def create_user(request: Request, body: UserCreate, user=Depends(require_permission("users"))):
     db = get_auth_db()
 
-    # Validate password strength
     valid, msg = validate_password_strength(body.password)
     if not valid:
         raise HTTPException(status_code=400, detail=msg)
 
-    # Check duplicate username/email
     if db.get_user(body.username):
         raise HTTPException(status_code=409, detail="Username already exists")
     if db.get_user_by_email(body.email):
@@ -188,20 +192,14 @@ async def create_user(request: Request, body: UserCreate):
 
 
 @router.patch("/admin/users/{user_id}")
-async def update_user(user_id: int, request: Request, body: UserUpdate):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def update_user(user_id: int, request: Request, body: UserUpdate, user=Depends(require_permission("users"))):
     db = get_auth_db()
     target = db.get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Prevent self-demotion
     if target["id"] == user.get("user_id") and body.role and body.role != user.get("role"):
         if user.get("role") == "super_admin":
-            # Count other super_admins
             users = db.list_users(role="super_admin")
             if len(users) <= 1:
                 raise HTTPException(status_code=400, detail="Cannot demote the last super_admin")
@@ -231,21 +229,15 @@ async def update_user(user_id: int, request: Request, body: UserUpdate):
 
 
 @router.delete("/admin/users/{user_id}")
-async def delete_user(user_id: int, request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def delete_user(user_id: int, request: Request, user=Depends(require_permission("users"))):
     db = get_auth_db()
     target = db.get_user_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Prevent self-deletion
     if target["id"] == user.get("user_id"):
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
 
-    # Prevent deleting last super_admin
     if target["role"] == "super_admin":
         users = db.list_users(role="super_admin")
         if len(users) <= 1:
@@ -260,11 +252,7 @@ async def delete_user(user_id: int, request: Request):
 # --- Dashboard ---
 
 @router.get("/admin/dashboard")
-async def get_dashboard(request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def get_dashboard(request: Request, user=Depends(require_permission("dashboard"))):
     db = get_auth_db()
     user_counts = db.count_users()
     audit = db.get_audit_log(limit=20)
@@ -277,19 +265,13 @@ async def get_dashboard(request: Request):
 
 
 @router.get("/admin/roles")
-async def list_roles(request: Request):
-    user = get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
+async def list_roles(request: Request, user=Depends(require_permission("roles"))):
     db = get_auth_db()
     return db.list_roles()
 
 
 @router.get("/admin/audit")
-async def get_audit(request: Request, limit: int = Query(100, le=500)):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
+async def get_audit(request: Request, user=Depends(require_permission("audit")), limit: int = Query(100, le=500)):
     db = get_auth_db()
     return db.get_audit_log(limit=limit)
 
@@ -309,16 +291,14 @@ class RoleUpdate(BaseModel):
 
 
 @router.post("/admin/roles")
-async def create_role(request: Request, body: RoleCreate):
-    user = get_current_user(request)
-    if not user or user.get("role") != "super_admin":
+async def create_role(request: Request, body: RoleCreate, user=Depends(require_permission("roles"))):
+    if user.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin only")
 
     db = get_auth_db()
     if db.get_role(body.name):
         raise HTTPException(status_code=409, detail="Role already exists")
 
-    # Validate permissions JSON
     try:
         json.loads(body.permissions)
     except json.JSONDecodeError:
@@ -340,9 +320,8 @@ async def create_role(request: Request, body: RoleCreate):
 
 
 @router.patch("/admin/roles/{role_name}")
-async def update_role(role_name: str, request: Request, body: RoleUpdate):
-    user = get_current_user(request)
-    if not user or user.get("role") != "super_admin":
+async def update_role(role_name: str, request: Request, body: RoleUpdate, user=Depends(require_permission("roles"))):
+    if user.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin only")
 
     db = get_auth_db()
@@ -381,9 +360,8 @@ async def update_role(role_name: str, request: Request, body: RoleUpdate):
 
 
 @router.delete("/admin/roles/{role_name}")
-async def delete_role(role_name: str, request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") != "super_admin":
+async def delete_role(role_name: str, request: Request, user=Depends(require_permission("roles"))):
+    if user.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin only")
 
     db = get_auth_db()
@@ -393,7 +371,6 @@ async def delete_role(role_name: str, request: Request):
     if role.get("is_system"):
         raise HTTPException(status_code=400, detail="Cannot delete system roles")
 
-    # Check if any users have this role
     users = db.list_users(role=role_name)
     if users:
         raise HTTPException(status_code=400, detail=f"Cannot delete role: {len(users)} users assigned")
@@ -412,22 +389,14 @@ async def delete_role(role_name: str, request: Request):
 # --- Service Management ---
 
 @router.get("/admin/services")
-async def list_services_admin(request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def list_services_admin(request: Request, user=Depends(require_permission("services"))):
     from app.services.service_manager import service_manager
     services = service_manager.list_services()
     return services
 
 
 @router.post("/admin/services")
-async def register_service_admin(request: Request, body: ServiceRegister):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def register_service_admin(request: Request, body: ServiceRegister, user=Depends(require_permission("services"))):
     from app.services.service_manager import service_manager
     try:
         info = await service_manager.register(body.id, body.name, body.base_url, body.description or "")
@@ -439,11 +408,7 @@ async def register_service_admin(request: Request, body: ServiceRegister):
 
 
 @router.delete("/admin/services/{service_id}")
-async def delete_service_admin(service_id: str, request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def delete_service_admin(service_id: str, request: Request, user=Depends(require_permission("services"))):
     from app.services.service_manager import service_manager
     ok = await service_manager.deregister(service_id)
     if not ok:
@@ -457,15 +422,10 @@ async def delete_service_admin(service_id: str, request: Request):
 # --- Analytics ---
 
 @router.get("/admin/analytics")
-async def get_analytics(request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") not in ("super_admin", "admin"):
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
+async def get_analytics(request: Request, user=Depends(require_permission("analytics"))):
     db = get_auth_db()
     conn = db._get_conn()
     try:
-        # Query counts by day (last 7 days)
         rows = conn.execute("""
             SELECT DATE(created_at) as day, COUNT(*) as cnt
             FROM audit_log
@@ -475,7 +435,6 @@ async def get_analytics(request: Request):
         """).fetchall()
         query_volume = [{"date": r["day"], "count": r["cnt"]} for r in rows]
 
-        # Action breakdown
         rows = conn.execute("""
             SELECT action, COUNT(*) as cnt
             FROM audit_log
@@ -484,7 +443,6 @@ async def get_analytics(request: Request):
         """).fetchall()
         action_breakdown = [{"action": r["action"], "count": r["cnt"]} for r in rows]
 
-        # Resource breakdown
         rows = conn.execute("""
             SELECT resource, COUNT(*) as cnt
             FROM audit_log
@@ -493,7 +451,6 @@ async def get_analytics(request: Request):
         """).fetchall()
         resource_breakdown = [{"resource": r["resource"], "count": r["cnt"]} for r in rows]
 
-        # Success/failure ratio
         rows = conn.execute("""
             SELECT status, COUNT(*) as cnt
             FROM audit_log
@@ -501,11 +458,9 @@ async def get_analytics(request: Request):
         """).fetchall()
         status_breakdown = [{"status": r["status"], "count": r["cnt"]} for r in rows]
 
-        # Total counts
         total_users = conn.execute("SELECT COUNT(*) as cnt FROM users").fetchone()["cnt"]
         total_audit = conn.execute("SELECT COUNT(*) as cnt FROM audit_log").fetchone()["cnt"]
 
-        # Services count
         from app.services.service_manager import service_manager
         services = service_manager.list_services()
 
@@ -525,11 +480,7 @@ async def get_analytics(request: Request):
 # --- System Settings ---
 
 @router.get("/admin/settings")
-async def get_settings(request: Request):
-    user = get_current_user(request)
-    if not user or user.get("role") != "super_admin":
-        raise HTTPException(status_code=403, detail="Super admin only")
-
+async def get_settings(request: Request, user=Depends(require_permission("settings"))):
     from app.config import settings
     return {
         "llm_provider": settings.llm_provider,
@@ -546,11 +497,7 @@ class SettingsUpdate(BaseModel):
 
 
 @router.patch("/admin/settings")
-async def update_settings(request: Request, body: SettingsUpdate):
-    user = get_current_user(request)
-    if not user or user.get("role") != "super_admin":
-        raise HTTPException(status_code=403, detail="Super admin only")
-
+async def update_settings(request: Request, body: SettingsUpdate, user=Depends(require_permission("settings"))):
     updates = {}
     if body.llm_provider is not None:
         updates["llm_provider"] = body.llm_provider
