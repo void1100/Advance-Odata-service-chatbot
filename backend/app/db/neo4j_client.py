@@ -162,6 +162,123 @@ class Neo4jClient:
             )
             return [dict(r) for r in result]
 
+    # --- Cross-Service Join ---
+
+    def upsert_join(self, join_def: Dict[str, Any]):
+        if not self._driver:
+            return
+        import json as _json
+        with self._driver.session() as session:
+            session.run(
+                """
+                MERGE (j:CrossServiceJoin {id: $id})
+                SET j.name = $name,
+                    j.strategy = $strategy,
+                    j.left_service = $left_service,
+                    j.left_entity = $left_entity,
+                    j.left_key = $left_key,
+                    j.right_service = $right_service,
+                    j.right_entity = $right_entity,
+                    j.right_key = $right_key,
+                    j.column_mapping = $column_mapping,
+                    j.description = $description,
+                    j.created_by = $created_by,
+                    j.created_at = $created_at
+                WITH j
+                MATCH (ls:Service {id: $left_service})
+                MATCH (rs:Service {id: $right_service})
+                MERGE (ls)-[:HAS_JOIN]->(j)
+                MERGE (rs)-[:HAS_JOIN]->(j)
+                WITH j, ls, rs
+                MATCH (le:Entity {service: $left_service, name: $left_entity})
+                MATCH (re:Entity {service: $right_service, name: $right_entity})
+                MERGE (le)-[:JOINS_IN]->(j)
+                MERGE (re)-[:JOINS_IN]->(j)
+                """,
+                id=join_def["id"],
+                name=join_def["name"],
+                strategy=join_def["strategy"],
+                left_service=join_def["left_service"],
+                left_entity=join_def["left_entity"],
+                left_key=join_def.get("left_key", ""),
+                right_service=join_def["right_service"],
+                right_entity=join_def["right_entity"],
+                right_key=join_def.get("right_key", ""),
+                column_mapping=_json.dumps(join_def.get("column_mapping", {})),
+                description=join_def.get("description", ""),
+                created_by=join_def.get("created_by", ""),
+                created_at=join_def.get("created_at", ""),
+            )
+
+    def list_joins(self) -> List[Dict[str, Any]]:
+        if not self._driver:
+            return []
+        import json as _json
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (j:CrossServiceJoin)
+                RETURN j.id AS id, j.name AS name, j.strategy AS strategy,
+                       j.left_service AS left_service, j.left_entity AS left_entity,
+                       j.left_key AS left_key, j.right_service AS right_service,
+                       j.right_entity AS right_entity, j.right_key AS right_key,
+                       j.column_mapping AS column_mapping, j.description AS description,
+                       j.created_by AS created_by, j.created_at AS created_at
+                ORDER BY j.created_at DESC
+                """
+            )
+            out = []
+            for r in result:
+                d = dict(r)
+                try:
+                    d["column_mapping"] = _json.loads(d.get("column_mapping") or "{}")
+                except Exception:
+                    d["column_mapping"] = {}
+                out.append(d)
+            return out
+
+    def get_join(self, join_id: str) -> Optional[Dict[str, Any]]:
+        if not self._driver:
+            return None
+        import json as _json
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (j:CrossServiceJoin {id: $id})
+                RETURN j.id AS id, j.name AS name, j.strategy AS strategy,
+                       j.left_service AS left_service, j.left_entity AS left_entity,
+                       j.left_key AS left_key, j.right_service AS right_service,
+                       j.right_entity AS right_entity, j.right_key AS right_key,
+                       j.column_mapping AS column_mapping, j.description AS description,
+                       j.created_by AS created_by, j.created_at AS created_at
+                """,
+                id=join_id,
+            )
+            record = result.single()
+            if not record:
+                return None
+            d = dict(record)
+            try:
+                d["column_mapping"] = _json.loads(d.get("column_mapping") or "{}")
+            except Exception:
+                d["column_mapping"] = {}
+            return d
+
+    def delete_join(self, join_id: str) -> bool:
+        if not self._driver:
+            return False
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (j:CrossServiceJoin {id: $id})
+                DETACH DELETE j
+                RETURN count(j) AS deleted
+                """,
+                id=join_id,
+            )
+            record = result.single()
+            return record["deleted"] > 0 if record else False
+
     def delete_entity(self, service_id: str, name: str) -> bool:
         if not self._driver:
             return False

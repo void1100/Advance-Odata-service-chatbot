@@ -190,7 +190,8 @@ def train_model(
     if not options:
         options = {}
 
-    feature_cols = [c for c in columns if c != target_col and c not in ("@odata.etag",)]
+    from app.services.response_sanitizer import EXCLUDE_COLUMNS
+    feature_cols = [c for c in columns if c != target_col and c not in EXCLUDE_COLUMNS]
     X, y_raw, feat_names = _prepare_features(rows, feature_cols, target_col)
 
     if len(X) < 2:

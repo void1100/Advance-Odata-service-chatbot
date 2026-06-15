@@ -13,6 +13,7 @@ class InMemoryGraph:
         self.entities: Dict[tuple, Dict[str, Any]] = {}
         self.relationships: List[Dict[str, Any]] = []
         self.roles: Dict[str, Dict[str, Any]] = {}
+        self.joins: Dict[str, Dict[str, Any]] = {}
 
     def is_available(self) -> bool:
         return True
@@ -133,12 +134,32 @@ class InMemoryGraph:
                 })
             return out
 
+    def upsert_join(self, join_def: Dict[str, Any]):
+        with self._lock:
+            self.joins[join_def["id"]] = join_def
+
+    def list_joins(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self.joins.values())
+
+    def get_join(self, join_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self.joins.get(join_id)
+
+    def delete_join(self, join_id: str) -> bool:
+        with self._lock:
+            if join_id in self.joins:
+                del self.joins[join_id]
+                return True
+            return False
+
     def clear(self):
         with self._lock:
             self.services.clear()
             self.entities.clear()
             self.relationships.clear()
             self.roles.clear()
+            self.joins.clear()
 
 
 _memory_graph: Optional[InMemoryGraph] = None

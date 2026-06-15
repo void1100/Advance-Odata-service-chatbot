@@ -375,15 +375,14 @@ class LLMReasoningEngine:
         )
         system_prompt = (
             "You are an OData query planner. Given a natural language question "
-            "and a list of available OData services, output JSON with keys: "
+            "and a list of available OData services with their entity sets and properties, "
+            "output JSON with keys: "
             "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
-            "and summary. Use only services and entity sets provided. "
-            "IMPORTANT: Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
+            "and summary. Use only services, entity sets, and properties provided. "
+            "IMPORTANT: Each entity_set includes a 'properties' list - use ONLY those property names in $select and $filter. "
+            "Do NOT guess or invent property names. "
+            "Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
             "Use the foreign key field directly (e.g. 'CategoryID eq 1'). "
-            "COLUMN SELECTION: Always include ID and Name columns in $select when available. "
-            "For Products include ProductID, ProductName. For Customers include CustomerID, CompanyName. "
-            "For Orders include OrderID. For Employees include EmployeeID, FirstName, LastName. "
-            "Never select only numeric columns - always include the primary key and name. "
             "PREDICTION: If the user asks 'what will X be if Y is Z' or 'predict X given Y', "
             "set intent to 'predict' and add a 'prediction' object to the plan with: "
             "entity_key (service_entity), features (dict of known values), target (the column to predict). "
@@ -396,6 +395,7 @@ class LLMReasoningEngine:
                     "id": s["id"],
                     "name": s["name"],
                     "entity_sets": s.get("entity_sets", []),
+                    "entity_properties": s.get("entity_properties", {}),
                     "description": s.get("description", ""),
                 }
                 for s in services
@@ -435,15 +435,14 @@ class LLMReasoningEngine:
         model = self.model or settings.llm_model or "gemini-2.0-flash"
         system_prompt = (
             "You are an OData query planner. Given a natural language question "
-            "and a list of available OData services, output JSON with keys: "
+            "and a list of available OData services with their entity sets and properties, "
+            "output JSON with keys: "
             "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
-            "and summary. Use only services and entity sets provided. "
-            "IMPORTANT: Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
+            "and summary. Use only services, entity sets, and properties provided. "
+            "IMPORTANT: Each entity_set includes a 'properties' list - use ONLY those property names in $select and $filter. "
+            "Do NOT guess or invent property names. "
+            "Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
             "Use the foreign key field directly (e.g. 'CategoryID eq 1'). "
-            "COLUMN SELECTION: Always include ID and Name columns in $select when available. "
-            "For Products include ProductID, ProductName. For Customers include CustomerID, CompanyName. "
-            "For Orders include OrderID. For Employees include EmployeeID, FirstName, LastName. "
-            "Never select only numeric columns - always include the primary key and name. "
             "PREDICTION: If the user asks 'what will X be if Y is Z' or 'predict X given Y', "
             "set intent to 'predict' and add a 'prediction' object to the plan with: "
             "entity_key (service_entity), features (dict of known values), target (the column to predict). "
@@ -456,6 +455,7 @@ class LLMReasoningEngine:
                     "id": s["id"],
                     "name": s["name"],
                     "entity_sets": s.get("entity_sets", []),
+                    "entity_properties": s.get("entity_properties", {}),
                     "description": s.get("description", ""),
                 }
                 for s in services
@@ -507,7 +507,7 @@ class LLMReasoningEngine:
             "failed_plan": failed_plan,
             "error": error_message,
             "services": [
-                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", [])}
+                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", []), "entity_properties": s.get("entity_properties", {})}
                 for s in services
             ],
         })
@@ -555,7 +555,7 @@ class LLMReasoningEngine:
             "failed_plan": failed_plan,
             "error": error_message,
             "services": [
-                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", [])}
+                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", []), "entity_properties": s.get("entity_properties", {})}
                 for s in services
             ],
         })
@@ -578,6 +578,79 @@ class LLMReasoningEngine:
             return json.loads(content), tokens
         except Exception:
             return None, tokens
+
+    async def generate(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.3,
+        max_tokens: int = 1000,
+    ) -> Dict[str, Any]:
+        """Generic chat completion for any message list."""
+        system_prompt = ""
+        user_prompt = ""
+        for m in messages:
+            if m["role"] == "system":
+                system_prompt = m["content"]
+            elif m["role"] == "user":
+                user_prompt = m["content"]
+
+        if self.provider == "openai" and settings.openai_api_key:
+            try:
+                return await self._generate_openai(system_prompt, user_prompt, temperature, max_tokens)
+            except Exception as e:
+                logger.warning(f"OpenAI generate failed: {e}")
+        elif self.provider == "gemini" and settings.gemini_api_key:
+            try:
+                return await self._generate_gemini(system_prompt, user_prompt, temperature, max_tokens)
+            except Exception as e:
+                logger.warning(f"Gemini generate failed: {e}")
+        return {"content": f"[Mock LLM] {user_prompt[:200]}", "provider": "mock", "tokens": 0}
+
+    async def _generate_openai(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
+        import httpx
+        headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        base_url = (settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=body)
+            if resp.status_code != 200:
+                logger.error(f"Groq API error {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            return {"content": content, "provider": "groq", "tokens": tokens}
+
+    async def _generate_gemini(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=settings.gemini_api_key)
+        model = self.model if self.model != "mock" else "gemini-flash-latest"
+        resp = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            ),
+        )
+        content = resp.text or ""
+        tokens = 0
+        try:
+            if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                tokens = getattr(resp.usage_metadata, "total_token_count", 0) or 0
+        except Exception:
+            tokens = 0
+        return {"content": content, "provider": "gemini", "tokens": tokens}
 
 
 llm_engine = LLMReasoningEngine()

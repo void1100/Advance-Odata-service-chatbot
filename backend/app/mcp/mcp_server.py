@@ -61,6 +61,17 @@ TOOLS: List[Dict[str, Any]] = [
             "required": ["session_id"],
         },
     },
+    {
+        "name": "execute_join",
+        "description": "Execute a saved cross-service join by ID and return merged results.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "join_id": {"type": "string", "description": "ID of the saved join to execute"},
+            },
+            "required": ["join_id"],
+        },
+    },
 ]
 
 
@@ -126,6 +137,8 @@ class MCPServer:
             return {"sessions": list_sessions()}
         if name == "get_messages":
             return {"messages": get_messages(arguments["session_id"])}
+        if name == "execute_join":
+            return await self._execute_join(arguments["join_id"])
         if name in self._custom_tool_names:
             return await self._call_custom_entity_tool(name, arguments)
         return {"error": f"Unknown tool: {name}"}
@@ -153,6 +166,56 @@ class MCPServer:
                 max_rows=arguments.get("top", 50),
             )
             return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _execute_join(self, join_id: str) -> Dict[str, Any]:
+        g = service_manager.graph()
+        join_def = g.get_join(join_id)
+        if not join_def:
+            return {"error": f"Join not found: {join_id}"}
+        from app.services.cross_service_join import union_join, match_join, enrichment_join
+        try:
+            left_client = service_manager.get_client(join_def["left_service"])
+            right_client = service_manager.get_client(join_def["right_service"])
+            if not left_client or not right_client:
+                return {"error": "Service client not available"}
+            left_table = await left_client.query(entity_set=join_def["left_entity"], top=200)
+            right_table = await right_client.query(entity_set=join_def["right_entity"], top=200)
+            left_data = left_client.flatten_odata_value(left_table)
+            right_data = right_client.flatten_odata_value(right_table)
+            left_cols = list(left_data[0].keys()) if left_data else []
+            right_cols = list(right_data[0].keys()) if right_data else []
+            strategy = join_def["strategy"]
+            if strategy == "union":
+                result = union_join(
+                    [
+                        {"service_id": join_def["left_service"], "table": {"columns": left_cols, "rows": left_data}},
+                        {"service_id": join_def["right_service"], "table": {"columns": right_cols, "rows": right_data}},
+                    ],
+                    column_mapping=join_def.get("column_mapping"),
+                )
+            elif strategy == "match":
+                result = match_join(
+                    {"columns": left_cols, "rows": left_data},
+                    {"columns": right_cols, "rows": right_data},
+                    left_key=join_def["left_key"],
+                    right_key=join_def["right_key"],
+                    left_service=join_def["left_service"],
+                    right_service=join_def["right_service"],
+                )
+            elif strategy == "enrichment":
+                result = enrichment_join(
+                    {"columns": left_cols, "rows": left_data},
+                    {"columns": right_cols, "rows": right_data},
+                    primary_key=join_def["left_key"],
+                    secondary_key=join_def["right_key"],
+                    primary_service=join_def["left_service"],
+                    secondary_service=join_def["right_service"],
+                )
+            else:
+                return {"error": f"Unknown strategy: {strategy}"}
+            return {"join": join_def, "result": result}
         except Exception as e:
             return {"error": str(e)}
 

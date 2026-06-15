@@ -214,12 +214,20 @@ class ODataServiceManager:
     def list_services(self) -> List[Dict[str, Any]]:
         out = []
         for sid, svc in self._services.items():
+            entity_props = {}
+            for es in svc["metadata"].get("entity_sets", []):
+                es_name = es["name"]
+                et_name = es.get("entity_type", es_name)
+                et = next((e for e in svc["metadata"].get("entity_types", []) if e["name"] == et_name), None)
+                props = [p["name"] for p in (et or {}).get("properties", [])]
+                entity_props[es_name] = props
             out.append({
                 "id": sid,
                 "name": svc["name"],
                 "base_url": svc["base_url"],
                 "description": svc["description"],
                 "entity_sets": [es["name"] for es in svc["metadata"].get("entity_sets", [])],
+                "entity_properties": entity_props,
             })
         return out
 

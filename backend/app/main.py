@@ -286,6 +286,231 @@ async def delete_custom_entity(service_id: str, name: str, request: Request):
         return {"deleted": name}
     raise HTTPException(status_code=404, detail="Custom entity not found")
 
+
+# --- Cross-Service Join Endpoints ---
+
+import uuid as _uuid
+from pydantic import BaseModel as _PydanticBase
+
+class JoinCreate(_PydanticBase):
+    name: str
+    strategy: str  # union, match, enrichment
+    left_service: str
+    left_entity: str
+    left_key: str = ""
+    right_service: str
+    right_entity: str
+    right_key: str = ""
+    column_mapping: Dict[str, Dict[str, str]] = {}
+    description: str = ""
+
+@app.get("/joins")
+async def list_joins(request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    g = service_manager.graph()
+    return g.list_joins()
+
+@app.post("/joins")
+async def create_join(payload: JoinCreate, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if payload.left_service not in service_manager._services:
+        raise HTTPException(status_code=400, detail=f"Unknown left service: {payload.left_service}")
+    if payload.right_service not in service_manager._services:
+        raise HTTPException(status_code=400, detail=f"Unknown right service: {payload.right_service}")
+    join_id = str(_uuid.uuid4())[:8]
+    join_def = {
+        "id": join_id,
+        "name": payload.name,
+        "strategy": payload.strategy,
+        "left_service": payload.left_service,
+        "left_entity": payload.left_entity,
+        "left_key": payload.left_key,
+        "right_service": payload.right_service,
+        "right_entity": payload.right_entity,
+        "right_key": payload.right_key,
+        "column_mapping": payload.column_mapping,
+        "description": payload.description,
+        "created_by": user.get("username", "admin"),
+        "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+    }
+    g = service_manager.graph()
+    g.upsert_join(join_def)
+    return join_def
+
+@app.delete("/joins/{join_id}")
+async def delete_join(join_id: str, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    g = service_manager.graph()
+    if g.delete_join(join_id):
+        return {"deleted": join_id}
+    raise HTTPException(status_code=404, detail="Join not found")
+
+@app.post("/joins/{join_id}/execute")
+async def execute_join(join_id: str, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    g = service_manager.graph()
+    join_def = g.get_join(join_id)
+    if not join_def:
+        raise HTTPException(status_code=404, detail="Join not found")
+    from app.services.cross_service_join import union_join, match_join, enrichment_join
+    try:
+        left_client = service_manager.get_client(join_def["left_service"])
+        right_client = service_manager.get_client(join_def["right_service"])
+        if not left_client or not right_client:
+            raise HTTPException(status_code=400, detail="Service client not available")
+        left_table = await left_client.query(entity_set=join_def["left_entity"], top=200)
+        right_table = await right_client.query(entity_set=join_def["right_entity"], top=200)
+        left_data = left_client.flatten_odata_value(left_table)
+        right_data = right_client.flatten_odata_value(right_table)
+        left_cols = list(left_data[0].keys()) if left_data else []
+        right_cols = list(right_data[0].keys()) if right_data else []
+        strategy = join_def["strategy"]
+        if strategy == "union":
+            result = union_join(
+                [
+                    {"service_id": join_def["left_service"], "table": {"columns": left_cols, "rows": left_data}},
+                    {"service_id": join_def["right_service"], "table": {"columns": right_cols, "rows": right_data}},
+                ],
+                column_mapping=join_def.get("column_mapping"),
+            )
+        elif strategy == "match":
+            result = match_join(
+                {"columns": left_cols, "rows": left_data},
+                {"columns": right_cols, "rows": right_data},
+                left_key=join_def["left_key"],
+                right_key=join_def["right_key"],
+                left_service=join_def["left_service"],
+                right_service=join_def["right_service"],
+            )
+        elif strategy == "enrichment":
+            result = enrichment_join(
+                {"columns": left_cols, "rows": left_data},
+                {"columns": right_cols, "rows": right_data},
+                primary_key=join_def["left_key"],
+                secondary_key=join_def["right_key"],
+                primary_service=join_def["left_service"],
+                secondary_service=join_def["right_service"],
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown strategy: {strategy}")
+        return {"join": join_def, "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Join execution failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/joins/{join_id}/chat")
+async def join_chat(join_id: str, request: Request):
+    user = get_current_user(request)
+    if not user or user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    body = await request.json()
+    query = body.get("query", "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+
+    g = service_manager.graph()
+    join_def = g.get_join(join_id)
+    if not join_def:
+        raise HTTPException(status_code=404, detail="Join not found")
+
+    from app.services.cross_service_join import union_join, match_join, enrichment_join
+    left_client = service_manager.get_client(join_def["left_service"])
+    right_client = service_manager.get_client(join_def["right_service"])
+    if not left_client or not right_client:
+        raise HTTPException(status_code=400, detail="Service client not available")
+
+    left_table = await left_client.query(entity_set=join_def["left_entity"], top=200)
+    right_table = await right_client.query(entity_set=join_def["right_entity"], top=200)
+    left_data = left_client.flatten_odata_value(left_table)
+    right_data = right_client.flatten_odata_value(right_table)
+    left_cols = list(left_data[0].keys()) if left_data else []
+    right_cols = list(right_data[0].keys()) if right_data else []
+
+    strategy = join_def["strategy"]
+    if strategy == "union":
+        result = union_join(
+            [
+                {"service_id": join_def["left_service"], "table": {"columns": left_cols, "rows": left_data}},
+                {"service_id": join_def["right_service"], "table": {"columns": right_cols, "rows": right_data}},
+            ],
+            column_mapping=join_def.get("column_mapping"),
+        )
+    elif strategy == "match":
+        result = match_join(
+            {"columns": left_cols, "rows": left_data},
+            {"columns": right_cols, "rows": right_data},
+            left_key=join_def["left_key"],
+            right_key=join_def["right_key"],
+            left_service=join_def["left_service"],
+            right_service=join_def["right_service"],
+        )
+    elif strategy == "enrichment":
+        result = enrichment_join(
+            {"columns": left_cols, "rows": left_data},
+            {"columns": right_cols, "rows": right_data},
+            primary_key=join_def["left_key"],
+            secondary_key=join_def["right_key"],
+            primary_service=join_def["left_service"],
+            secondary_service=join_def["right_service"],
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown strategy: {strategy}")
+
+    rows = result.get("rows", [])
+    cols = result.get("columns", [])
+    important_cols = [c for c in cols if not c.startswith("@odata") and c not in ("Emails", "AddressInfo", "Concurrency", "Photo", "Notes", "PhotoPath")]
+    sample_rows = rows[:10]
+    data_summary = " | ".join(important_cols) + "\n"
+    data_summary += "\n".join(" | ".join(str(r.get(c, ""))[:30] for c in important_cols) for r in sample_rows)
+    if len(rows) > 10:
+        data_summary += f"\n... ({len(rows)} total rows)"
+
+    system_prompt = (
+        "You are a data analyst. Answer questions about this cross-service join result.\n"
+        f"Join: {join_def['name']} ({strategy})\n"
+        f"Left: {join_def['left_service']}.{join_def['left_entity']}\n"
+        f"Right: {join_def['right_service']}.{join_def['right_entity']}\n"
+        f"Columns: {', '.join(important_cols)}\n"
+        f"Total rows: {len(rows)}\n\n"
+        "Data sample:\n" + data_summary + "\n\n"
+        "Be concise. Answer based on this data."
+    )
+
+    try:
+        from app.agents.reasoning_engine import llm_engine
+        response = await llm_engine.generate(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        answer = response.get("content", "No response from LLM.")
+        provider = response.get("provider", "unknown")
+        return {
+            "answer": answer,
+            "provider": provider,
+            "join_name": join_def["name"],
+            "row_count": len(rows),
+        }
+    except Exception as e:
+        logger.error(f"Join chat failed: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM Error: {str(e)}")
+
+
 @app.get("/roles")
 async def get_roles():
     return policy_engine.list_roles()
@@ -581,8 +806,6 @@ async def get_session_messages(session_id: str):
 @app.post("/analyze")
 async def analyze_table(payload: Dict[str, Any], request: Request):
     user = get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
     table = payload.get("table")
     if not table or not table.get("rows"):
         raise HTTPException(status_code=400, detail="No table data to analyze")
@@ -598,8 +821,6 @@ async def analyze_table(payload: Dict[str, Any], request: Request):
 @app.post("/ml/clean")
 async def ml_clean(payload: Dict[str, Any], request: Request):
     user = get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
     table = payload.get("table")
     options = payload.get("options", {})
     if not table or not table.get("rows"):
@@ -616,8 +837,6 @@ async def ml_clean(payload: Dict[str, Any], request: Request):
 @app.post("/ml/train")
 async def ml_train(payload: Dict[str, Any], request: Request):
     user = get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Authentication required")
     table = payload.get("table")
     target_col = payload.get("target_column")
     algorithm = payload.get("algorithm", "random_forest")
@@ -801,3 +1020,72 @@ async def mcp_call(payload: MCPCallRequest, request: Request):
         raise HTTPException(status_code=401, detail="Authentication required")
     result = await mcp_server.call_tool(payload.name, payload.arguments)
     return MCPCallResponse(result=result)
+
+
+@app.post("/share")
+async def share_chat(request: Request):
+    user = get_current_user(request)
+
+    body = await request.json()
+    channel = body.get("channel", "clipboard")
+    query = body.get("query", "")
+    summary = body.get("summary", "")
+    table = body.get("table")
+    session_id = body.get("session_id", "")
+
+    if not query and not summary:
+        raise HTTPException(status_code=400, detail="No content to share")
+
+    share_text = f"Chat Query: {query}\n\nResult: {summary}"
+    if table and table.get("rows"):
+        cols = table.get("columns", [])
+        rows = table.get("rows", [])[:20]
+        share_text += "\n\nData:\n" + " | ".join(cols) + "\n"
+        share_text += "\n".join(
+            " | ".join(str(r.get(c, "")) for c in cols) for r in rows
+        )
+        if len(table.get("rows", [])) > 20:
+            share_text += f"\n... and {len(table['rows']) - 20} more rows"
+
+    user_info = {
+        "username": user.get("username", "unknown") if user else "anonymous",
+        "email": user.get("email", "") if user else "",
+        "role": user.get("role", "") if user else "",
+    }
+
+    payload = {
+        "channel": channel,
+        "query": query,
+        "summary": summary,
+        "share_text": share_text,
+        "session_id": session_id,
+        "user": user_info,
+        "table_summary": {
+            "columns": table.get("columns", []) if table else [],
+            "row_count": len(table.get("rows", [])) if table else 0,
+        },
+    }
+
+    if channel == "clipboard":
+        return {
+            "success": True,
+            "channel": "clipboard",
+            "share_text": share_text,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(settings.n8n_webhook_url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning(f"n8n returned {resp.status_code}: {resp.text[:200]}")
+            return {
+                "success": resp.status_code < 400,
+                "channel": channel,
+                "n8n_status": resp.status_code,
+                "share_text": share_text,
+            }
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail="n8n webhook unreachable. Check n8n service is running.")
+    except Exception as e:
+        logger.error(f"Share failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Share failed: {str(e)}")

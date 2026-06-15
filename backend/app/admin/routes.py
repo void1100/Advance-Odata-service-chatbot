@@ -19,8 +19,8 @@ from app.schemas.models import ServiceRegister
 router = APIRouter()
 
 ROLE_PERMISSIONS = {
-    "super_admin": {"dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"},
-    "admin": {"dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"},
+    "super_admin": {"dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "audit", "settings"},
+    "admin": {"dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "audit", "settings"},
     "analyst": {"dashboard", "analytics", "services"},
     "user": {"dashboard"},
     "viewer": {"dashboard"},

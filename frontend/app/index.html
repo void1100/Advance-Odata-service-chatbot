@@ -69,6 +69,41 @@
         <textarea id="queryInput" placeholder="Ask a natural-language question..." rows="2"></textarea>
         <button id="sendBtn">Send</button>
       </footer>
+
+      <div id="shareFab" class="share-fab" title="Share chat">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+      </div>
+
+      <div id="shareModal" class="modal hidden">
+        <div class="modal-content share-modal">
+          <header>
+            <h2>Share Chat</h2>
+            <button class="close" id="closeShareModal">x</button>
+          </header>
+          <div class="share-body">
+            <div class="share-preview" id="sharePreview"></div>
+            <div class="share-channels">
+              <button class="share-channel-btn" data-channel="email" title="Share via Email">
+                <span class="share-icon">&#9993;</span>
+                <span>Email</span>
+              </button>
+              <button class="share-channel-btn" data-channel="whatsapp" title="Share via WhatsApp">
+                <span class="share-icon">&#128172;</span>
+                <span>WhatsApp</span>
+              </button>
+              <button class="share-channel-btn" data-channel="clipboard" title="Copy to clipboard">
+                <span class="share-icon">&#128203;</span>
+                <span>Copy</span>
+              </button>
+              <button class="share-channel-btn" data-channel="slack" title="Share to Slack">
+                <span class="share-icon">&#128188;</span>
+                <span>Slack</span>
+              </button>
+            </div>
+            <div class="share-status" id="shareStatus"></div>
+          </div>
+        </div>
+      </div>
     </main>
 
     <div id="servicesModal" class="modal hidden">

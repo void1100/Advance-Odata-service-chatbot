@@ -210,6 +210,21 @@ function downloadCsv(table, label) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function formatCellValue(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") {
+    if (Array.isArray(v)) return v.length ? `[${v.length} items]` : "[]";
+    return JSON.stringify(v);
+  }
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d.toLocaleDateString();
+  }
+  if (s.length > 60) return s.slice(0, 57) + "...";
+  return s;
+}
+
 function renderTable(table, paginationInfo = null) {
   if (!table || !table.columns || !table.rows || !table.rows.length) return null;
   const wrap = document.createElement("div");
@@ -238,8 +253,8 @@ function renderTable(table, paginationInfo = null) {
     const tr = document.createElement("tr");
     table.columns.forEach((c) => {
       const td = document.createElement("td");
-      const v = row[c];
-      td.textContent = typeof v === "object" && v !== null ? JSON.stringify(v) : (v ?? "");
+      td.textContent = formatCellValue(row[c]);
+      td.title = typeof row[c] === "object" ? JSON.stringify(row[c]) : String(row[c] ?? "");
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
@@ -1452,6 +1467,9 @@ async function send() {
   isLoading = true;
   sendBtn.disabled = true;
   sendBtn.textContent = "Sending...";
+  lastQuery = q;
+  lastSummary = "";
+  lastTable = null;
   if (messagesEl.querySelector(".empty-state")) messagesEl.innerHTML = "";
   addUserBubble(q);
   queryInput.value = "";
@@ -1465,6 +1483,8 @@ async function send() {
       },
     });
     currentSessionId = resp.session_id;
+    lastSummary = resp.summary;
+    lastTable = resp.table;
     addAssistantBubble(resp.summary, {
       table: resp.table,
       tool_calls: resp.tool_calls,
@@ -1633,3 +1653,120 @@ addServiceForm.addEventListener("submit", async (e) => {
 
 checkHealth();
 loadSessions();
+
+const shareFab = $("shareFab");
+const shareModal = $("shareModal");
+const closeShareModal = $("closeShareModal");
+const sharePreview = $("sharePreview");
+const shareStatus = $("shareStatus");
+let lastQuery = "";
+let lastSummary = "";
+let lastTable = null;
+
+function trackLastMessage(query, summary, table) {
+  lastQuery = query || "";
+  lastSummary = summary || "";
+  lastTable = table || null;
+}
+
+if (shareFab) {
+  shareFab.addEventListener("click", () => {
+    if (!lastQuery && !lastSummary) {
+      shareStatus.textContent = "No chat content to share yet.";
+      shareStatus.className = "share-status error";
+      shareModal.classList.remove("hidden");
+      return;
+    }
+    let preview = `Query: ${lastQuery}\n\n${lastSummary}`;
+    if (lastTable && lastTable.rows && lastTable.rows.length) {
+      preview += `\n\nData: ${lastTable.rows.length} rows (${lastTable.columns.join(", ")})`;
+    }
+    sharePreview.textContent = preview;
+    shareStatus.textContent = "";
+    shareStatus.className = "share-status";
+    shareModal.classList.remove("hidden");
+  });
+}
+
+if (closeShareModal) {
+  closeShareModal.addEventListener("click", () => shareModal.classList.add("hidden"));
+  shareModal.addEventListener("click", (e) => {
+    if (e.target === shareModal) shareModal.classList.add("hidden");
+  });
+}
+
+document.querySelectorAll(".share-channel-btn").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const channel = btn.dataset.channel;
+    if (channel === "clipboard" || channel === "copy") {
+      let text = `Query: ${lastQuery}\n\n${lastSummary}`;
+      if (lastTable && lastTable.rows) {
+        const cols = lastTable.columns;
+        text += "\n\n" + cols.join(" | ") + "\n";
+        text += lastTable.rows.slice(0, 20).map((r) => cols.map((c) => r[c] ?? "").join(" | ")).join("\n");
+        if (lastTable.rows.length > 20) text += `\n... and ${lastTable.rows.length - 20} more rows`;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        shareStatus.textContent = "Copied to clipboard!";
+        shareStatus.className = "share-status success";
+      } catch {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          shareStatus.textContent = "Copied to clipboard!";
+          shareStatus.className = "share-status success";
+        } catch {
+          shareStatus.textContent = "Failed to copy. Please select and copy manually.";
+          shareStatus.className = "share-status error";
+        }
+      }
+      return;
+    }
+    if (channel === "email" || channel === "whatsapp" || channel === "slack") {
+      let text = `Query: ${lastQuery}\n\n${lastSummary}`;
+      if (lastTable && lastTable.rows) {
+        const cols = lastTable.columns;
+        text += "\n\n" + cols.join(" | ") + "\n";
+        text += lastTable.rows.slice(0, 20).map((r) => cols.map((c) => r[c] ?? "").join(" | ")).join("\n");
+        if (lastTable.rows.length > 20) text += `\n... and ${lastTable.rows.length - 20} more rows`;
+      }
+      if (channel === "email") {
+        window.open(`mailto:?subject=Chat Result&body=${encodeURIComponent(text)}`, "_blank");
+        shareStatus.textContent = "Opened email client!";
+        shareStatus.className = "share-status success";
+      } else if (channel === "whatsapp") {
+        window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank");
+        shareStatus.textContent = "Opened WhatsApp!";
+        shareStatus.className = "share-status success";
+      } else if (channel === "slack") {
+        try {
+          const resp = await api("/share", {
+            method: "POST",
+            body: { channel, query: lastQuery, summary: lastSummary, table: lastTable, session_id: currentSessionId || "" },
+          });
+          shareStatus.textContent = resp.success ? "Shared to Slack!" : `Slack share failed: ${resp.detail || "n8n workflow not configured"}`;
+          shareStatus.className = resp.success ? "share-status success" : "share-status error";
+        } catch (e) {
+          shareStatus.textContent = "Slack requires n8n webhook. Copy text and paste manually.";
+          shareStatus.className = "share-status error";
+        }
+      }
+      return;
+    }
+  });
+});
+
+const origAddAssistant = addAssistantBubble;
+function addAssistantBubbleTracked(summary, result, scroll, paginationInfo) {
+  origAddAssistant(summary, result, scroll, paginationInfo);
+  if (result) {
+    trackLastMessage(lastQuery, summary, result.table);
+  }
+}

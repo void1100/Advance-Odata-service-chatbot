@@ -1,0 +1,177 @@
+{
+  "name": "Chat Share Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "chat-share",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "string": [
+                  {
+                    "value1": "={{ $json.channel }}",
+                    "operation": "equals",
+                    "value2": "email"
+                  }
+                ]
+              },
+              "output": 0,
+              "renameOutput": true,
+              "outputLabel": "Email"
+            },
+            {
+              "conditions": {
+                "string": [
+                  {
+                    "value1": "={{ $json.channel }}",
+                    "operation": "equals",
+                    "value2": "whatsapp"
+                  }
+                ]
+              },
+              "output": 1,
+              "renameOutput": true,
+              "outputLabel": "WhatsApp"
+            },
+            {
+              "conditions": {
+                "string": [
+                  {
+                    "value1": "={{ $json.channel }}",
+                    "operation": "equals",
+                    "value2": "clipboard"
+                  }
+                ]
+              },
+              "output": 2,
+              "renameOutput": true,
+              "outputLabel": "Clipboard"
+            }
+          ]
+        },
+        "fallbackOutput": 3,
+        "fallbackLabel": "Other"
+      },
+      "id": "switch-channel",
+      "name": "Switch Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_FROM || 'noreply@odata-orchestration.local' }}",
+        "toEmail": "={{ $json.user.email || $env.SHARE_EMAIL_TO || 'admin@localhost' }}",
+        "subject": "Chat Share: {{ $json.query }}",
+        "text": "={{ $json.share_text }}",
+        "options": {}
+      },
+      "id": "send-email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1,
+      "position": [750, 200],
+      "disabled": true,
+      "notes": "Enable after configuring SMTP credentials in n8n"
+    },
+    {
+      "parameters": {
+        "phoneNumber": "={{ $env.WHATSAPP_PHONE || '+1234567890' }}",
+        "message": "={{ $json.share_text }}",
+        "additionalFields": {}
+      },
+      "id": "send-whatsapp",
+      "name": "Send WhatsApp",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [750, 350],
+      "disabled": true,
+      "notes": "Enable after configuring Twilio credentials in n8n"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, channel: $json.channel, message: 'Shared via ' + $json.channel }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, channel: 'clipboard', message: 'Share text generated. Copy from the response.' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-clipboard",
+      "name": "Respond Clipboard",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [750, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, channel: $json.channel, message: 'Channel processed' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-other",
+      "name": "Respond Other",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [750, 650]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Switch Channel", "type": "main", "index": 0 }]
+      ]
+    },
+    "Switch Channel": {
+      "main": [
+        [{ "node": "Send Email", "type": "main", "index": 0 }],
+        [{ "node": "Send WhatsApp", "type": "main", "index": 0 }],
+        [{ "node": "Respond Clipboard", "type": "main", "index": 0 }],
+        [{ "node": "Respond Other", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send WhatsApp": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [{ "name": "chat-share" }]
+}

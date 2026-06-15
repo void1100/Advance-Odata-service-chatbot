@@ -1,106 +1,124 @@
 # Advanced OData Service Orchestration (MCP-Based)
 
-A self-contained, locally-runnable implementation of the **Advanced OData
-Service Orchestration Architecture** shown in the design. It connects to any
-OData v4 service, orchestrates queries through an LLM reasoning engine, and
-exposes a chat-style frontend for natural-language interaction.
+A self-contained, locally-runnable implementation of the **Advanced OData Service Orchestration Architecture**. It connects to any OData v4 service, orchestrates queries through an LLM reasoning engine, and exposes a chat-style frontend for natural-language interaction.
 
-## Quick start (Docker)
+## Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+- Git installed
+- (Optional) A free LLM API key for real AI responses (Groq or Gemini recommended)
+
+## Clone & Run
+
+### 1. Clone the repository
 
 ```bash
-docker compose up -d --build
+git clone https://github.com/<your-username>/<repo-name>.git
+cd <repo-name>
 ```
 
-Wait ~30s for everything to start, then open **`http://localhost:3000`**.
+### 2. (Optional) Configure an LLM API key
 
-This brings up:
-- **Frontend** (nginx) at `http://localhost:3000` — landing page
-- **Chat App** at `http://localhost:3000/app/` — main chatbot UI
-- **Admin Portal** at `http://localhost:3000/admin/` — auth + RBAC management
-- **Backend** (FastAPI) at `http://localhost:8000` (docs at `/docs`)
-- **Neo4j** graph DB at `bolt://localhost:7687` (browser at `http://localhost:7474`)
-- **Sample OData service** at `http://localhost:5000`
-- **n8n** workflow automation at `http://localhost:5678` (admin/admin)
-- A one-shot **seeder** that registers the Northwind and sample OData services
+Create a `.env` file in the project root:
 
-After the first build, services (including Northwind) are auto-registered.
-On subsequent restarts the backend re-hydrates its in-memory service
-registry from Neo4j, so the seed only needs to run once per fresh
-`neo4j_data` volume.
-
-To stop:
 ```bash
-docker compose down
+# For Groq (recommended — free tier: 14,400 requests/day)
+LLM_PROVIDER=openai
+OPENAI_API_KEY=gsk_your_key_here
+OPENAI_BASE_URL=https://api.groq.com/openai/v1
+LLM_MODEL=llama-3.3-70b-versatile
 ```
 
-To wipe all data (including Neo4j):
-```bash
-docker compose down -v
-```
-
-## Pages
-
-| URL | Description |
-|-----|-------------|
-| `http://localhost:3000` | Landing page — hero, features, how it works, ML algorithms, tech stack |
-| `http://localhost:3000/app/` | Chat app — NL queries, charts, ML analysis, service health |
-| `http://localhost:3000/admin/` | Admin portal — login, dashboard, users, roles, services, analytics, audit |
-| `http://localhost:8000/docs` | API documentation (Swagger) |
-| `http://localhost:7474` | Neo4j browser (neo4j/neo4j) |
-| `http://localhost:5678` | n8n workflow automation (admin/admin) |
-
-## Admin Portal
-
-Default admin credentials:
-- **Username:** `admin`
-- **Password:** `admin123!`
-
-Features:
-- **Dashboard**: user counts, service counts, recent audit activity
-- **User Management**: create/edit/delete users, assign roles, search, status toggle
-- **Role Management**: 5 default roles (super_admin, admin, analyst, user, viewer), create custom roles, granular permissions
-- **Service Management**: register/deregister OData services via URL
-- **Analytics**: query volume, action/resource/status breakdowns
-- **Audit Log**: tracks all actions with timestamps
-- **Settings**: LLM provider/model, CORS, system config
-
-## LLM Providers
-
-The system supports multiple LLM providers. Set your preferred provider via
-the UI dropdown or the API:
-
-| Provider | Model | Free Tier |
-|----------|-------|-----------|
-| Groq | llama-3.3-70b-versatile | 14,400 RPD, 30 RPM |
-| Gemini | gemini-2.0-flash | 15 RPM, 1500 RPD |
-| OpenAI | gpt-4o-mini | Pay-per-use |
-| Mock | Deterministic planner | Unlimited |
+Or for Gemini:
 
 ```bash
-# Set Groq (recommended for free usage)
-GROQ_API_KEY=gsk_... docker compose up -d
-
-# Set Gemini
-GEMINI_API_KEY=AIza... docker compose up -d
-
-# Set OpenAI
-OPENAI_API_KEY=sk-... docker compose up -d
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=AIza_your_key_here
+LLM_MODEL=gemini-2.0-flash
 ```
 
 Free API keys:
 - Groq: https://console.groq.com/keys
 - Gemini: https://aistudio.google.com/apikey
 
-### Sample queries to try in the chat
+> **Note:** Without an API key, the system uses a mock LLM that echoes queries back.
 
+### 3. Start with Docker
+
+```bash
+docker compose up -d --build
+```
+
+Wait ~30-60 seconds for all services to start.
+
+### 4. Open the application
+
+| Page | URL |
+|------|-----|
+| **Landing Page** | http://localhost:3000 |
+| **Chat App** | http://localhost:3000/app/ |
+| **Admin Portal** | http://localhost:3000/admin/ |
+| **API Docs (Swagger)** | http://localhost:8000/docs |
+| **Neo4j Browser** | http://localhost:7474 |
+| **n8n Workflows** | http://localhost:5678 |
+
+## Default Credentials
+
+| Service | Username | Password |
+|---------|----------|----------|
+| Admin Portal | `admin` | `admin123!` |
+| Neo4j | `neo4j` | `password` |
+| n8n | `admin` | `admin` |
+
+## Usage
+
+### Chat App (`/app/`)
+
+1. Type a natural language query in the input box
+2. Press Enter or click **Send**
+3. View results in **Table**, **Graph**, or **Analyze** tabs
+4. Use **Download CSV** to export data
+5. Switch LLM model using the dropdown in the sidebar
+
+**Sample queries:**
 ```
 Show top 5 customers from Germany
 List all products in Beverages category
-Show top 10 orders with status Shipped
 How many customers are in France?
 Show top 5 most expensive products
-Show customers with their orders
+Show all Airlines from trippin
+Retrieve top 20 products with prices and stock from Northwind and Sample services
 ```
+
+### Admin Portal (`/admin/`)
+
+1. Login with `admin` / `admin123!`
+2. Use the sidebar to navigate:
+   - **Dashboard**: Overview of users, services, audit activity
+   - **User Management**: Create/edit/delete users, assign roles
+   - **Role Management**: 5 default roles, custom roles with granular permissions
+   - **Service Management**: Register new OData services by URL
+   - **Custom Entities**: Create virtual entities from real OData entities
+   - **Join Services**: Join entities across different OData services
+   - **Analytics**: Query volume, action breakdowns
+   - **Audit Log**: All admin actions tracked
+   - **Settings**: LLM provider/model, system config
+
+### Join Services Chatbot
+
+1. Go to **Admin Portal → Join Services**
+2. Click **Execute** on a join
+3. Scroll down to the **"Ask about this data"** chatbot
+4. Type questions about the joined data:
+   - "How many rows are from each service?"
+   - "Show me only FirstName and LastName columns"
+   - "Filter by source_service = trippin"
+
+### Share Feature
+
+1. Run a query in the chat
+2. Click the **blue share button** (bottom-right)
+3. Pick a channel: Email, WhatsApp, Copy, or Slack
 
 ## Features
 
@@ -112,36 +130,35 @@ Show customers with their orders
 - Vector memory for context from prior conversations
 
 ### Chart Visualization
-Results are displayed with **Table | Graph** tabs:
-- **Table**: Full data table with OData metadata columns filtered out
-- **Graph**: Auto-detects best visualization from data shape
-  - **Pie Chart**: Categorical data with 2-8 unique values
-  - **Bar Chart**: Numerical comparisons (auto-rotates horizontal for 6+ labels)
-  - **Network Graph**: Entity relationships (hub-and-spoke with force-directed layout)
-- Sub-tabs (Auto/Pie/Bar/Network) for manual override
-- Insights panel with reasoning and observations
+- **Table**: Full data table with OData metadata filtered out
+- **Graph**: Auto-detects best visualization:
+  - Pie Chart (categorical data)
+  - Bar Chart (numerical comparisons)
+  - Network Graph (entity relationships)
+- Sub-tabs for manual override (Auto/Pie/Bar/Network)
 
 ### ML Analysis (16 Algorithms)
-Click the **Analyze** tab to run ML algorithms on query results:
+Click the **Analyze** tab to run ML on query results:
 
-**Unsupervised (5 algorithms):**
-- Summary Statistics (mean, median, std, min/max)
-- Anomaly Detection (Z-score, rows with z > 2 flagged)
-- Correlation Analysis (Pearson)
-- K-Means Clustering (k=2 or k=3)
-- Feature Importance (variance contribution)
+**Unsupervised (5):**
+- Summary Statistics, Anomaly Detection, Correlation, K-Means, Feature Importance
 
-**Supervised (11 algorithms):**
-- Decision Tree, Random Forest, XGBoost, CatBoost
-- Logistic Regression, KNN, SVM
-- Gradient Boosting, Ada Boost, Extra Trees
-- Naive Bayes
+**Supervised (12):**
+- Decision Tree, Random Forest, Linear Regression, Logistic Regression
+- XGBoost, CatBoost, KNN, SVM, Gradient Boosting, Ada Boost, Extra Trees, Naive Bayes
 
 **Data Cleaning Pipeline:**
-- Missing values: drop, mean, median, mode, zero
-- Outlier removal: Z-score, IQR
-- Normalization: min-max, Z-score
-- Categorical encoding, deduplication
+- Missing values, outlier removal, normalization, encoding, deduplication
+
+### Cross-Service Joins
+- Union: Stack rows from multiple services
+- Match: Join by common key
+- Enrichment: Primary + secondary lookup
+
+### Custom Entities
+- Create virtual entities from real OData entities
+- Auto-generates MCP tools per custom entity
+- Persisted in Neo4j graph
 
 ### Authentication & Authorization
 - JWT tokens with httpOnly cookies
@@ -154,34 +171,51 @@ Click the **Analyze** tab to run ML algorithms on query results:
 - Toggle via sun/moon button in header
 - Persists across sessions
 - Auto-detects system preference
-- URL param: `?theme=dark`
 
-### Service Health
-- Health badges for all registered services
-- Status: healthy (green), degraded (yellow), down (red)
-- Latency measurement for each service
+## LLM Providers
 
-### LLM Model Switcher
-- Runtime switching between 9 LLM options
-- Persisted in localStorage
-- Badge shows active provider (openai/groq/gemini/mock)
+| Provider | Model | Free Tier |
+|----------|-------|-----------|
+| Groq | llama-3.3-70b-versatile | 14,400 RPD, 30 RPM |
+| Groq | llama-3.1-8b-instant | Fastest |
+| Gemini | gemini-2.0-flash | 15 RPM, 1500 RPD |
+| OpenAI | gpt-4o-mini | Pay-per-use |
+| Mock | Deterministic planner | Unlimited |
 
-## Architecture
+## Docker Services
 
+| Service | Port | Description |
+|---------|------|-------------|
+| frontend | 3000 | nginx serving landing, chat, admin |
+| backend | 8000 | FastAPI REST API |
+| neo4j | 7474, 7687 | Graph database |
+| sample-odata | 5000 | Local test OData service |
+| n8n | 5678 | Workflow automation |
+
+## Commands
+
+```bash
+# Start all services
+docker compose up -d --build
+
+# Stop all services
+docker compose down
+
+# Stop and wipe all data
+docker compose down -v
+
+# Rebuild a specific service
+docker compose up -d --build backend
+
+# View logs
+docker logs odata-backend -f
+docker logs odata-frontend -f
+
+# Restart backend
+docker restart odata-backend
 ```
-        Problem & Input                Orchestration Layer                  Service Execution Layer
-        ───────────────                ──────────────────                  ──────────────────────
-        User Interface                 Service Discovery Agent             MCP Protocol Bridge
-        Natural Language Query ─►      Tool Registry (ChromaDB)            OData Request Builder
-                                       Schema Store (OData CSDL)           Response Sanitizer
-                                       LLM Reasoning Engine                OData Endpoints
-                                       Relationship & Access Manager
-                                       Graph DB (Neo4j + in-memory fallback)
-                                       Authorization & Policy Engine
-                                       Vector Memory (ChromaDB)
-```
 
-## Project structure
+## Project Structure
 
 ```
 project_root/
@@ -197,42 +231,40 @@ project_root/
 │   │   ├── config.py
 │   │   └── main.py
 │   ├── data/                      # SQLite auth DB (persisted via volume)
-│   ├── scripts/seed_sample_service.py
 │   ├── requirements.txt
-│   ├── .env.example
 │   └── run.py
 ├── frontend/
-│   ├── index.html                 # Landing page (hero, features, algorithms, tech stack)
-│   ├── landing.html               # Landing page source
+│   ├── index.html                 # Landing page
 │   ├── app/                       # Chat application
-│   │   ├── index.html             # Chat UI with Table|Graph|Analyze tabs
-│   │   ├── styles.css             # Dark mode, result panels, chart styles
-│   │   └── app.js                 # Chart renderers, ML analysis, data analyzer
+│   │   ├── index.html
+│   │   ├── styles.css
+│   │   └── app.js
 │   └── admin/                     # Admin portal
-│       ├── index.html             # Login + dashboard shell
-│       ├── styles.css             # Dark mode, sidebar, tables, modals
-│       └── app.js                 # Auth flow, user/role/service CRUD, analytics
-├── sample_odata_service/          # A tiny local OData v4 service for testing
-│   ├── app.py
-│   └── requirements.txt
-├── docker-compose.yml             # 5 services: frontend, backend, neo4j, sample-odata, n8n
+│       ├── index.html
+│       ├── styles.css
+│       └── app.js
+├── sample_odata_service/          # Local OData v4 test service
+├── n8n-workflows/                 # n8n workflow templates
+├── docker-compose.yml
+├── .env.example
 └── README.md
 ```
 
-## API Surface
+## API Endpoints
 
 ### Chat & Analysis
-
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/chat` | POST | Natural-language query endpoint |
-| `/analyze` | POST | Run unsupervised ML on table data |
+| `/chat` | POST | Natural-language query |
+| `/analyze` | POST | Unsupervised ML analysis |
 | `/ml/train` | POST | Train supervised ML model |
-| `/ml/clean` | POST | Run data cleaning pipeline |
-| `/ml/algorithms` | GET | List all 11 supervised algorithms |
+| `/ml/clean` | POST | Data cleaning pipeline |
+| `/ml/predict` | POST | Predict using trained model |
+| `/ml/algorithms` | GET | List supported algorithms |
+| `/ml/models` | GET | List trained models |
+| `/share` | POST | Share chat via n8n webhook |
 
 ### Services
-
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/services` | GET / POST | List / register OData services |
@@ -240,45 +272,58 @@ project_root/
 | `/services/{id}/refresh` | POST | Re-fetch metadata |
 | `/services/health` | GET | Health check all services |
 
-### Auth & Admin
-
+### Custom Entities & Joins
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/auth/login` | POST | Login (returns JWT) |
+| `/custom_entities` | GET | List custom entities |
+| `/custom_entities/{svc}` | POST / DELETE | Create / delete custom entity |
+| `/joins` | GET / POST | List / create joins |
+| `/joins/{id}` | DELETE | Delete a join |
+| `/joins/{id}/execute` | POST | Execute a join |
+| `/joins/{id}/chat` | POST | Chat about join data |
+
+### Auth & Admin
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/auth/login` | POST | Login |
 | `/auth/logout` | POST | Logout |
-| `/auth/me` | GET | Current user info |
-| `/auth/refresh` | POST | Refresh token |
+| `/auth/me` | GET | Current user |
 | `/admin/users` | GET / POST | List / create users |
-| `/admin/users/{id}` | PATCH / DELETE | Update / delete user |
 | `/admin/roles` | GET / POST | List / create roles |
-| `/admin/roles/{name}` | PATCH / DELETE | Update / delete role |
-| `/admin/services` | GET / POST | List / register services |
-| `/admin/services/{id}` | DELETE | Deregister service |
-| `/admin/analytics` | GET | Query volume + breakdowns |
+| `/admin/analytics` | GET | Query analytics |
 | `/admin/audit` | GET | Audit log |
-| `/admin/settings` | GET / PATCH | System settings |
 | `/admin/dashboard` | GET | Dashboard summary |
 
 ### LLM & Sessions
-
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/llm/config` | GET / POST | Get / set LLM provider and model |
+| `/llm/config` | GET / POST | Get / set LLM provider/model |
 | `/sessions` | GET / POST | Chat sessions |
-| `/sessions/{id}` | PATCH / DELETE | Rename / delete a session |
 | `/sessions/{id}/messages` | GET | Message history |
 
 ### MCP
-
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/mcp/tools` | GET | List MCP-style tools |
-| `/mcp/call` | POST | Call an MCP-style tool |
+| `/mcp/tools` | GET | List MCP tools |
+| `/mcp/call` | POST | Call an MCP tool |
 
-## Using the MCP server from an MCP-compatible client
+## Troubleshooting
 
-The backend exposes MCP-style tools at `/mcp/tools` and `/mcp/call`. The
-included `app/mcp/mcp_server.py` also includes the tool definitions
-(`list_services`, `register_service`, `query_odata`, `list_sessions`,
-`get_messages`) which can be wired into a stdio MCP transport by adapting the
-`call_tool` method into an MCP server entrypoint.
+**Services won't start:**
+- Ensure Docker Desktop is running
+- Check ports 3000, 5000, 7474, 7687, 8000, 5678 are not in use
+
+**LLM returns mock responses:**
+- Check `.env` file exists with valid API key
+- Restart backend: `docker restart odata-backend`
+
+**Query returns 0 rows:**
+- Check the service is registered: `http://localhost:8000/services`
+- Try a simpler query: "Show top 5 customers"
+
+**Admin portal shows "Authentication required":**
+- Login at `http://localhost:3000/admin/` with `admin` / `admin123!`
+
+## License
+
+MIT

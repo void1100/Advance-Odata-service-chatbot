@@ -89,6 +89,7 @@ function navigateTo(page) {
     roles: "Role Management",
     services: "Service Management",
     custom_entities: "Custom Entities",
+    joins: "Join Services",
     analytics: "Analytics",
     audit: "Audit Log",
     settings: "System Settings",
@@ -105,6 +106,7 @@ async function loadPage(page) {
     else if (page === "roles") await loadRoles(content);
     else if (page === "services") await loadServices(content);
     else if (page === "custom_entities") await loadCustomEntities(content);
+    else if (page === "joins") await loadJoins(content);
     else if (page === "analytics") await loadAnalytics(content);
     else if (page === "audit") await loadAudit(content);
     else if (page === "settings") await loadSettings(content);
@@ -684,6 +686,230 @@ async function testCustomEntity(serviceId, name) {
   }
 }
 
+// --- Join Services ---
+async function loadJoins(el) {
+  const [joins, services] = await Promise.all([
+    api("/joins"),
+    api("/services"),
+  ]);
+  window._joinServices = services;
+  el.innerHTML = `
+    <div class="table-wrap">
+      <div class="table-header">
+        <h2>Cross-Service Joins (${joins.length})</h2>
+        <div class="table-actions">
+          <button class="btn btn-primary btn-sm" onclick="showCreateJoin()">+ Create Join</button>
+        </div>
+      </div>
+      ${joins.length === 0 ? '<div class="empty-state"><p>No joins defined yet. Click "+ Create Join" to combine entities from different services.</p></div>' : `
+      <table>
+        <thead><tr><th>Name</th><th>Strategy</th><th>Left</th><th>Right</th><th>Description</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${joins.map(j => `
+            <tr>
+              <td><strong>${escapeHtml(j.name)}</strong></td>
+              <td><span class="badge badge-active">${escapeHtml(j.strategy)}</span></td>
+              <td>${escapeHtml(j.left_service)}.${escapeHtml(j.left_entity)}</td>
+              <td>${escapeHtml(j.right_service)}.${escapeHtml(j.right_entity)}</td>
+              <td>${escapeHtml(j.description || "—")}</td>
+              <td>${j.created_at ? new Date(j.created_at).toLocaleDateString() : "—"}</td>
+              <td>
+                <button class="btn btn-primary btn-sm" onclick="executeJoin('${j.id}')">Execute</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteJoin('${j.id}')">Delete</button>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>`}
+    </div>
+    <div id="joinResult" style="margin-top:24px"></div>
+  `;
+}
+
+function showCreateJoin() {
+  const services = window._joinServices || [];
+  const svcOpts = services.map(s => `<option value="${s.id}">${escapeHtml(s.name)} (${s.id}) — ${s.entity_sets.length} entities</option>`).join("");
+  showModal(`
+    <h2 style="margin:0 0 16px">Create Cross-Service Join</h2>
+    <div class="form-group">
+      <label>Join Name</label>
+      <input type="text" id="joinName" class="form-input" placeholder="e.g. Products_Comparison">
+    </div>
+    <div class="form-group">
+      <label>Strategy</label>
+      <select id="joinStrategy" class="form-input" onchange="updateJoinForm()">
+        <option value="union">Union (Stack rows from both services)</option>
+        <option value="match">Match (Join by common key)</option>
+        <option value="enrichment">Enrichment (Primary + Secondary lookup)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Left Service</label>
+      <select id="joinLeftSvc" class="form-input" onchange="updateJoinEntities('left')">${svcOpts}</select>
+    </div>
+    <div class="form-group">
+      <label>Left Entity</label>
+      <select id="joinLeftEntity" class="form-input"><option>Loading...</option></select>
+    </div>
+    <div class="form-group" id="joinLeftKeyGroup" style="display:none">
+      <label>Left Join Key</label>
+      <input type="text" id="joinLeftKey" class="form-input" placeholder="e.g. ProductID">
+    </div>
+    <div class="form-group">
+      <label>Right Service</label>
+      <select id="joinRightSvc" class="form-input" onchange="updateJoinEntities('right')">${svcOpts}</select>
+    </div>
+    <div class="form-group">
+      <label>Right Entity</label>
+      <select id="joinRightEntity" class="form-input"><option>Loading...</option></select>
+    </div>
+    <div class="form-group" id="joinRightKeyGroup" style="display:none">
+      <label>Right Join Key</label>
+      <input type="text" id="joinRightKey" class="form-input" placeholder="e.g. ProductID">
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <input type="text" id="joinDesc" class="form-input" placeholder="e.g. Compare products across services">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitCreateJoin()">Create</button>
+    </div>
+  `);
+  updateJoinEntities("left");
+  updateJoinEntities("right");
+}
+
+function updateJoinForm() {
+  const strategy = document.getElementById("joinStrategy").value;
+  document.getElementById("joinLeftKeyGroup").style.display = (strategy === "match" || strategy === "enrichment") ? "" : "none";
+  document.getElementById("joinRightKeyGroup").style.display = (strategy === "match" || strategy === "enrichment") ? "" : "none";
+}
+
+function updateJoinEntities(side) {
+  const svcSel = document.getElementById(`join${side === "left" ? "Left" : "Right"}Svc`);
+  const entSel = document.getElementById(`join${side === "left" ? "Left" : "Right"}Entity`);
+  const services = window._joinServices || [];
+  const svc = services.find(s => s.id === svcSel.value);
+  entSel.innerHTML = (svc?.entity_sets || []).map(es => `<option value="${es}">${es}</option>`).join("");
+}
+
+async function submitCreateJoin() {
+  const name = document.getElementById("joinName").value.trim();
+  const strategy = document.getElementById("joinStrategy").value;
+  const leftSvc = document.getElementById("joinLeftSvc").value;
+  const leftEntity = document.getElementById("joinLeftEntity").value;
+  const leftKey = document.getElementById("joinLeftKey").value.trim();
+  const rightSvc = document.getElementById("joinRightSvc").value;
+  const rightEntity = document.getElementById("joinRightEntity").value;
+  const rightKey = document.getElementById("joinRightKey").value.trim();
+  const desc = document.getElementById("joinDesc").value.trim();
+  if (!name) return toast("Name is required", "error");
+  if (!leftEntity || !rightEntity) return toast("Both entities required", "error");
+  if ((strategy === "match" || strategy === "enrichment") && (!leftKey || !rightKey)) return toast("Join keys required for this strategy", "error");
+  try {
+    await api("/joins", {
+      method: "POST",
+      body: { name, strategy, left_service: leftSvc, left_entity: leftEntity, left_key: leftKey, right_service: rightSvc, right_entity: rightEntity, right_key: rightKey, description: desc },
+    });
+    closeModal(); toast("Join created");
+    loadJoins(document.getElementById("pageContent"));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function executeJoin(joinId) {
+  const resultDiv = document.getElementById("joinResult");
+  resultDiv.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted)">Loading...</div>';
+  try {
+    const data = await api(`/joins/${joinId}/execute`, { method: "POST" });
+    const r = data.result;
+    window._currentJoinId = joinId;
+    window._currentJoinData = data;
+    const hideCols = ["@odata.id", "@odata.etag", "@odata.editLink", "Emails", "AddressInfo", "Concurrency", "Photo", "Notes", "PhotoPath"];
+    const displayCols = r.columns.filter(c => !hideCols.includes(c));
+    let html = '';
+    html += '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;margin-bottom:16px">';
+    html += '<div style="padding:12px 16px;border-bottom:1px solid var(--border)"><strong>' + escapeHtml(data.join.name) + ' &mdash; ' + escapeHtml(r.strategy) + ' &mdash; ' + r.row_count + ' rows</strong></div>';
+    html += '<div style="overflow-x:auto">';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px;line-height:1">';
+    html += '<thead><tr>';
+    displayCols.forEach(function(c) {
+      html += '<th style="padding:4px 6px;text-align:left;background:var(--bg-elev);border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--text-muted);white-space:nowrap">' + escapeHtml(c) + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+    r.rows.slice(0, 50).forEach(function(row) {
+      html += '<tr>';
+      displayCols.forEach(function(c) {
+        var val = String(row[c] ?? '');
+        if (val.length > 30) val = val.substring(0, 30) + '...';
+        html += '<td style="padding:3px 6px;border-bottom:1px solid var(--border);white-space:nowrap;font-size:12px">' + escapeHtml(val) + '</td>';
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+    if (r.row_count > 50) html += '<div style="padding:4px 8px;font-size:11px;color:var(--text-muted)">Showing 50 of ' + r.row_count + ' rows</div>';
+    html += '</div>';
+    html += '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px">';
+    html += '<div style="padding:8px 16px;border-bottom:1px solid var(--border);background:var(--bg-elev)"><strong style="font-size:12px">Ask about this data</strong></div>';
+    html += '<div id="joinChatMessages" style="height:180px;overflow-y:auto;padding:10px"></div>';
+    html += '<div style="padding:6px 10px;border-top:1px solid var(--border);display:flex;gap:6px;background:var(--bg-elev)">';
+    html += '<input type="text" id="joinChatInput" placeholder="Ask about this join..." style="flex:1;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px;background:var(--bg-input);color:var(--text)" />';
+    html += '<button class="btn btn-primary btn-sm" onclick="sendJoinChat()" style="padding:6px 12px;font-size:11px">Ask</button>';
+    html += '</div></div>';
+    resultDiv.innerHTML = html;
+    document.getElementById("joinChatInput").addEventListener("keydown", function(e) { if (e.key === "Enter") sendJoinChat(); });
+    document.getElementById("joinChatInput").focus();
+  } catch (e) {
+    resultDiv.innerHTML = '<div style="padding:16px;color:var(--danger)">Error: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+async function sendJoinChat() {
+  const input = document.getElementById("joinChatInput");
+  const messagesEl = document.getElementById("joinChatMessages");
+  const query = input.value.trim();
+  if (!query || !window._currentJoinId) return;
+  input.value = "";
+  const userDiv = document.createElement("div");
+  userDiv.style.cssText = "align-self:flex-end;background:var(--accent);color:white;padding:8px 12px;border-radius:12px 12px 2px 12px;font-size:12px;max-width:75%;word-wrap:break-word";
+  userDiv.textContent = query;
+  messagesEl.appendChild(userDiv);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  const loadingDiv = document.createElement("div");
+  loadingDiv.style.cssText = "align-self:flex-start;padding:8px 12px;font-size:12px;color:var(--text-muted);font-style:italic";
+  loadingDiv.textContent = "Thinking...";
+  messagesEl.appendChild(loadingDiv);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  try {
+    const resp = await api(`/joins/${window._currentJoinId}/chat`, {
+      method: "POST",
+      body: { query },
+    });
+    loadingDiv.remove();
+    const ansDiv = document.createElement("div");
+    ansDiv.style.cssText = "align-self:flex-start;background:var(--bg-elev-2);padding:10px 14px;border-radius:12px 12px 12px 2px;font-size:12px;max-width:80%;border:1px solid var(--border);line-height:1.5";
+    const formatted = escapeHtml(resp.answer).replace(/\n/g, "<br>").replace(/\|/g, "<span style='color:var(--text-muted)'>|</span>");
+    ansDiv.innerHTML = `<div style="margin-bottom:6px;font-size:10px;color:var(--accent);font-weight:600;text-transform:uppercase">${escapeHtml(resp.provider)}</div><div>${formatted}</div>`;
+    messagesEl.appendChild(ansDiv);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  } catch (e) {
+    loadingDiv.remove();
+    const errDiv = document.createElement("div");
+    errDiv.style.cssText = "align-self:flex-start;padding:8px 12px;font-size:12px;color:var(--danger);background:#fef2f2;border-radius:8px;border:1px solid #fecaca";
+    errDiv.textContent = "Error: " + e.message;
+    messagesEl.appendChild(errDiv);
+  }
+}
+
+async function deleteJoin(joinId) {
+  if (!confirm("Delete this join?")) return;
+  try {
+    await api(`/joins/${joinId}`, { method: "DELETE" });
+    toast("Join deleted");
+    loadJoins(document.getElementById("pageContent"));
+  } catch (e) { toast(e.message, "error"); }
+}
+
 // --- Analytics ---
 async function loadAnalytics(el) {
   const data = await api("/admin/analytics");
@@ -819,8 +1045,8 @@ async function init() {
 }
 
 const ROLE_PERMISSIONS = {
-  super_admin: ["dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"],
-  admin: ["dashboard", "users", "roles", "services", "custom_entities", "analytics", "audit", "settings"],
+  super_admin: ["dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "audit", "settings"],
+  admin: ["dashboard", "users", "roles", "services", "custom_entities", "joins", "analytics", "audit", "settings"],
   analyst: ["dashboard", "analytics", "services"],
   user: ["dashboard"],
   viewer: ["dashboard"],
