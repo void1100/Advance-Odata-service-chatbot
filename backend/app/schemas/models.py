@@ -78,6 +78,9 @@ class ChatResponse(BaseModel):
     llm_provider: str = "unknown"
     llm_latency_ms: int = 0
     llm_tokens: int = 0
+    chart_recommendations: List[Dict[str, Any]] = []
+    drill_down_links: List[Dict[str, Any]] = []
+    cached: bool = False
 
 
 class SessionCreate(BaseModel):

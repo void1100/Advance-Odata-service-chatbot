@@ -30,7 +30,15 @@ def detect_post_processing(query: str) -> Optional[Dict[str, Any]]:
         return {"type": "comparison", "compare_groups": mentioned[:2]}
 
     if has_percentage:
-        return {"type": "percentage", "target_groups": mentioned}
+        min_pct = None
+        m = re.search(r'(?:more|greater|higher|above)\s+than\s+(\d+(?:\.\d+)?)\s*%', q)
+        if m:
+            min_pct = float(m.group(1))
+        else:
+            m = re.search(r'(\d+(?:\.\d+)?)\s*%\s+(?:or\s+more|and\s+above|and\s+more)', q)
+            if m:
+                min_pct = float(m.group(1))
+        return {"type": "percentage", "target_groups": mentioned, "min_percentage": min_pct}
 
     if has_extremum:
         extremum = "min" if re.search(r'least|fewest|lowest|minimum|min', q) else "max"
@@ -100,6 +108,10 @@ def _compute_percentage(rows: List[Dict], columns: List[str], pp_info: Dict[str,
         })
 
     result_rows.sort(key=lambda x: x.get("percentage", 0), reverse=True)
+
+    min_pct = pp_info.get("min_percentage")
+    if min_pct is not None:
+        result_rows = [r for r in result_rows if r.get("percentage", 0) > min_pct]
 
     return {
         "columns": [group_col, "count", "percentage"],

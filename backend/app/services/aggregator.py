@@ -24,6 +24,16 @@ AGGREGATION_PATTERNS = [
     (r'\bmin\b.*\bper\b\s+(\w+)', "min", None),
     (r'\bmaximum\b\s+(\w+).*\bper\b\s+(\w+)', "max", None),
     (r'\bmax\b.*\bper\b\s+(\w+)', "max", None),
+    (r'percentage.*\btotal\b.*\beach\b\s+(\w+)', "sum", None),
+    (r'percentage.*\btotal\b.*\bby\b\s+(?:each\s+)?(\w+)', "sum", None),
+    (r'percentage.*\btotal\b.*\bper\b\s+(\w+)', "sum", None),
+    (r'percentage.*\btotal\b.*\bfor\s+(?:each\s+)?(\w+)', "sum", None),
+    (r'percentage.*\beach\b\s+(\w+)', "count", None),
+    (r'percentage.*\bby\b\s+(?:each\s+)?(\w+)', "count", None),
+    (r'percentage.*\bper\b\s+(\w+)', "count", None),
+    (r'percentage.*\bfor\s+(?:each\s+)?(\w+)', "count", None),
+    (r'percentage.*\bgenerated\s+by\s+(?:each\s+)?(\w+)', "count", None),
+    (r'percent.*\bcontribution\b.*\bby\b\s+(?:each\s+)?(\w+)', "count", None),
 ]
 
 SIMPLE_COUNT_PATTERNS = [
@@ -97,27 +107,43 @@ def detect_aggregation(query: str) -> Optional[Dict[str, Any]]:
 
 def _find_column(columns: List[str], name: str) -> Optional[str]:
     """Find the best matching column name (case-insensitive, partial match).
-    Prefers name/text columns over ID columns."""
+    Prefers name/text columns over ID columns. Includes semantic fallbacks
+    so 'country' also matches 'region', 'location', etc."""
     name_lower = name.lower().strip()
     id_cols = {"id", "orderid", "customerid", "productid", "employeeid", "supplierid", "categoryid", "territoryid"}
 
-    for c in columns:
-        if c.lower() == name_lower:
-            return c
+    SEMANTIC_ALIASES = {
+        "country": ["country", "region", "location", "area", "territory", "zone", "geo", "nation", "state", "province", "city"],
+        "region": ["region", "country", "location", "area", "territory", "zone", "geo"],
+        "city": ["city", "location", "town", "municipality"],
+        "category": ["category", "type", "group", "class", "segment"],
+        "product": ["product", "item", "sku", "goods"],
+        "customer": ["customer", "client", "buyer", "account", "contact"],
+        "date": ["date", "time", "created", "updated", "timestamp"],
+    }
 
-    name_matches = []
-    for c in columns:
-        cl = c.lower()
-        if name_lower in cl or cl.startswith(name_lower):
-            if cl not in id_cols and not cl.endswith("id"):
-                name_matches.append(c)
-    if name_matches:
-        return name_matches[0]
+    aliases = SEMANTIC_ALIASES.get(name_lower, [name_lower])
 
-    for c in columns:
-        cl = c.lower()
-        if name_lower in cl or cl.startswith(name_lower):
-            return c
+    for alias in aliases:
+        for c in columns:
+            if c.lower() == alias:
+                return c
+
+    for alias in aliases:
+        name_matches = []
+        for c in columns:
+            cl = c.lower()
+            if alias in cl or cl.startswith(alias):
+                if cl not in id_cols and not cl.endswith("id"):
+                    name_matches.append(c)
+        if name_matches:
+            return name_matches[0]
+
+    for alias in aliases:
+        for c in columns:
+            cl = c.lower()
+            if alias in cl or cl.startswith(alias):
+                return c
 
     return None
 

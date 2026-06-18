@@ -171,54 +171,120 @@ class LLMReasoningEngine:
         if not svc:
             return None, []
         qn = q.lower()
-        for es in svc.get("entity_sets", []):
-            if es.lower() in qn:
-                return es, []
+
+        analytics_keywords = {"sales", "sale", "revenue", "turnover", "total sales", "percentage", "profit", "income", "earnings"}
+        has_analytics = any(kw in qn for kw in analytics_keywords)
+
+        if has_analytics:
+            found = self._pick_analytics_entity(svc, qn)
+            if found:
+                return found, []
+
         synonyms = {
-            "customer": ["Customers", "Customer_and_Suppliers_by_Cities"],
-            "customers": ["Customers", "Customer_and_Suppliers_by_Cities"],
-            "client": ["Customers", "Customer_and_Suppliers_by_Cities"],
-            "order": ["Orders", "Invoices", "Order_Subtotals", "Order_Details_Extendeds"],
-            "orders": ["Orders", "Invoices", "Order_Subtotals", "Order_Details_Extendeds"],
-            "purchase": ["Orders", "Invoices"],
-            "purchases": ["Orders", "Invoices"],
-            "product": ["Products", "Alphabetical_list_of_products", "Products_by_Categories", "Products_Above_Average_Prices"],
-            "products": ["Products", "Alphabetical_list_of_products", "Products_by_Categories", "Products_Above_Average_Prices"],
-            "item": ["Products", "Order_Details"],
-            "items": ["Products", "Order_Details"],
-            "category": ["Categories", "Products_by_Categories", "Category_Sales_for_1997"],
-            "categories": ["Categories", "Products_by_Categories", "Category_Sales_for_1997"],
-            "supplier": ["Suppliers", "Customer_and_Suppliers_by_Cities"],
-            "suppliers": ["Suppliers", "Customer_and_Suppliers_by_Cities"],
-            "vendor": ["Suppliers", "Customer_and_Suppliers_by_Cities"],
-            "employee": ["Employees"],
-            "employees": ["Employees"],
-            "staff": ["Employees"],
-            "shipper": ["Shippers"],
-            "shippers": ["Shippers"],
-            "region": ["Regions"],
-            "regions": ["Regions"],
-            "territory": ["Territories"],
-            "territories": ["Territories"],
-            "invoice": ["Invoices", "Orders"],
-            "invoices": ["Invoices", "Orders"],
-            "line item": ["Order_Details", "Order_Details_Extendeds"],
-            "line items": ["Order_Details", "Order_Details_Extendeds"],
+            "sale": ["sale", "invoice", "order"],
+            "sales": ["sale", "invoice", "order"],
+            "revenue": ["sale", "invoice", "order", "revenue"],
+            "turnover": ["sale", "invoice", "order"],
+            "customer": ["customer", "client"],
+            "customers": ["customer", "client"],
+            "client": ["customer", "client"],
+            "order": ["order", "purchase"],
+            "orders": ["order", "purchase"],
+            "purchase": ["order", "purchase"],
+            "purchases": ["order", "purchase"],
+            "product": ["product", "item"],
+            "products": ["product", "item"],
+            "item": ["product", "item", "detail"],
+            "items": ["product", "item", "detail"],
+            "category": ["categor"],
+            "categories": ["categor"],
+            "supplier": ["supplier", "vendor"],
+            "suppliers": ["supplier", "vendor"],
+            "vendor": ["supplier", "vendor"],
+            "employee": ["employ", "staff"],
+            "employees": ["employ", "staff"],
+            "staff": ["employ", "staff"],
+            "shipper": ["ship", "carrier"],
+            "shippers": ["ship", "carrier"],
+            "region": ["region", "territory"],
+            "regions": ["region", "territory"],
+            "territory": ["territory", "region"],
+            "territories": ["territory", "region"],
+            "invoice": ["invoice", "bill"],
+            "invoices": ["invoice", "bill"],
+            "line item": ["detail", "line"],
+            "line items": ["detail", "line"],
         }
-        for token, candidates in synonyms.items():
+        available_entities = svc.get("entity_sets", [])
+        for token, stems in synonyms.items():
             if token in qn:
-                for c in candidates:
-                    if c in svc.get("entity_sets", []):
-                        return c, []
+                # First try exact name match
+                for es in available_entities:
+                    if es.lower() == token or es.lower() == token + "s":
+                        return es, []
+                # Then try stem matching (entity name contains any of the stems)
+                for es in available_entities:
+                    es_lower = es.lower()
+                    if any(stem in es_lower for stem in stems):
+                        return es, []
         if "how many" in qn or "count" in qn:
-            for c in ("Customers", "Orders", "Products", "Suppliers", "Employees"):
-                if c in svc.get("entity_sets", []):
-                    return c, []
+            # Pick the first entity that looks like a main table
+            for es in available_entities:
+                es_lower = es.lower()
+                if not any(v in es_lower for v in ["view", "summary", "list", "by_", "for_", "extended", "subtotal"]):
+                    return es, []
+        if not has_analytics:
+            qn_words = set(re.findall(r'[a-z]+', qn))
+            for es in svc.get("entity_sets", []):
+                es_words = set(re.findall(r'[a-z]+', es.lower()))
+                if es_words and es_words.issubset(qn_words):
+                    return es, []
         for es in svc.get("entity_sets", []):
             es_l = es.lower().replace("_", " ")
             if es_l in qn or es_l.replace(" ", "") in qn.replace(" ", ""):
                 return es, []
         return svc.get("entity_sets", [None])[0], []
+
+    def _pick_analytics_entity(self, svc: Dict[str, Any], qn: str):
+        """Generic entity picker for analytics/sales queries.
+        Searches entity set names and properties for sales-related keywords."""
+        entity_sets = svc.get("entity_sets", [])
+        entity_props = svc.get("entity_properties", {})
+
+        sales_name_kws = {"sale", "sales", "invoice", "revenue", "order", "transaction", "deal", "payment", "financial"}
+        amount_col_kws = {"amount", "price", "total", "revenue", "sales", "cost", "value", "sum", "extended", "sub"}
+        location_col_kws = {"country", "region", "city", "state", "territory", "area", "zone", "location"}
+
+        best_entity = None
+        best_score = -1
+
+        for es_name in entity_sets:
+            score = 0
+            es_lower = es_name.lower().replace("_", " ")
+
+            for kw in sales_name_kws:
+                if kw in es_lower:
+                    score += 3
+                    break
+
+            props = entity_props.get(es_name, [])
+            props_lower = [p.lower() for p in props]
+
+            has_amount = any(any(ak in p for ak in amount_col_kws) for p in props_lower)
+            has_location = any(any(lk in p for lk in location_col_kws) for p in props_lower)
+
+            if has_amount:
+                score += 2
+            if has_location:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_entity = es_name
+
+        if best_entity and best_score >= 3:
+            return best_entity
+        return None
 
     def _build_query_parts(self, q: str, entity_set: Optional[str], candidate_properties: List[str]):
         select: List[str] = []
@@ -248,43 +314,12 @@ class LLMReasoningEngine:
         if m:
             country = m.group(1).title()
             explicit_filters.append(f"Country eq '{country}'")
-        if entity_set in ("Products", "Alphabetical_list_of_products"):
-            category_map = {
-                "beverages": 1,
-                "condiments": 2,
-                "confections": 3,
-                "dairy products": 4,
-                "grains/cereals": 5,
-                "meat/poultry": 6,
-                "produce": 7,
-                "seafood": 8,
-            }
-            for kw, cat_id in category_map.items():
-                if re.search(rf"\b{re.escape(kw)}\b", q):
-                    explicit_filters.append(f"CategoryID eq {cat_id}")
-                    break
-        if entity_set == "Products_by_Categories":
-            category_names = {
-                "beverages": "Beverages",
-                "condiments": "Condiments",
-                "confections": "Confections",
-                "dairy products": "Dairy Products",
-                "grains/cereals": "Grains/Cereals",
-                "meat/poultry": "Meat/Poultry",
-                "produce": "Produce",
-                "seafood": "Seafood",
-            }
-            for kw, cat in category_names.items():
-                if re.search(rf"\b{re.escape(kw)}\b", q):
-                    explicit_filters.append(f"CategoryName eq '{cat}'")
-                    break
-        if entity_set in ("Orders", "Invoices"):
-            if re.search(r"\bshipped\b", q):
-                explicit_filters.append("ShippedDate ne null")
-            if re.search(r"\bunshipped\b|\bnot\s+shipped\b", q):
-                explicit_filters.append("ShippedDate eq null")
+        if re.search(r"\bshipped\b", q):
+            explicit_filters.append("ShippedDate ne null")
+        if re.search(r"\bunshipped\b|\bnot\s+shipped\b", q):
+            explicit_filters.append("ShippedDate eq null")
         m = re.search(r"(?:price|amount|total)\s*(>|>=|<|<=)\s*(\d+(?:\.\d+)?)", q)
-        if m and entity_set in ("Products", "Order_Details", "Order_Details_Extendeds"):
+        if m:
             explicit_filters.append(f"UnitPrice {m.group(1)} {m.group(2)}")
         if explicit_filters:
             filter_expr = " and ".join(explicit_filters)

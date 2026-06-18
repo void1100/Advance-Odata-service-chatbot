@@ -5,6 +5,7 @@ Supports: Decision Tree, Random Forest, XGBoost, CatBoost, Logistic Regression,
 """
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
+from loguru import logger
 
 
 def _sanitize(obj):
@@ -145,14 +146,20 @@ def _prepare_features(
 
 def _detect_task_type(y: np.ndarray) -> str:
     """Detect if this is classification or regression."""
-    # String or object arrays are always classification
-    if y.dtype.kind in ('U', 'S', 'O'):
+    # String, object, or boolean arrays are always classification
+    if y.dtype.kind in ('U', 'S', 'O', 'b'):
+        logger.debug(f"Task detection: dtype '{y.dtype}' → classification")
         return "classification"
     unique = np.unique(y[~np.isnan(y)] if y.dtype == float else y)
-    # Only treat as classification if very few unique integer values (like Yes/No, 0/1/2)
+    logger.debug(f"Task detection: unique={unique}, dtype={y.dtype}, len={len(unique)}")
+    # Only treat as classification if very few unique integer-like values (like Yes/No, 0/1/2)
     if len(unique) <= 5:
-        if all(isinstance(v, (int, np.integer)) or (isinstance(v, float) and v == int(v)) for v in unique):
+        all_int_like = all(isinstance(v, (int, np.integer, np.bool_)) or (isinstance(v, float) and v == int(v)) for v in unique)
+        logger.debug(f"Task detection: all_int_like={all_int_like}")
+        if all_int_like:
+            logger.debug(f"Task detection: → classification")
             return "classification"
+    logger.debug(f"Task detection: → regression")
     return "regression"
 
 
@@ -199,6 +206,7 @@ def train_model(
 
     task_type = _detect_task_type(y_raw)
     target_mapping = None
+    logger.info(f"train_model: target_col={target_col}, y_raw dtype={y_raw.dtype}, unique={np.unique(y_raw)}, task_type={task_type}")
 
     if task_type == "classification":
         y, target_mapping = _encode_target(y_raw)

@@ -238,6 +238,10 @@ class ODataServiceManager:
         Also restores custom entities and re-registers MCP tools.
         """
         g = self.graph()
+        if hasattr(g, '_driver') and g._driver is None:
+            logger.info("Neo4j was unavailable at startup, attempting reconnect...")
+            g._connect(retries=2, delay=3)
+            g = self.graph()
         try:
             persisted = g.list_all_services()
         except Exception as e:
@@ -366,8 +370,8 @@ class ODataServiceManager:
                 for k in r.keys():
                     if k not in columns and not k.startswith("@odata"):
                         columns.append(k)
-        if len(columns) > 10:
-            columns = columns[:10]
+        if len(columns) > 30:
+            columns = columns[:30]
         cleaned_rows = [{k: v for k, v in r.items() if k in columns} for r in cleaned_rows]
 
         sanitized = {

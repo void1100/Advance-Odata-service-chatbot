@@ -10,18 +10,24 @@ class Neo4jClient:
         self._driver: Optional[Driver] = None
         self._connect()
 
-    def _connect(self):
-        try:
-            self._driver = GraphDatabase.driver(
-                settings.neo4j_uri,
-                auth=(settings.neo4j_user, settings.neo4j_password),
-            )
-            self._driver.verify_connectivity()
-            logger.info(f"Connected to Neo4j at {settings.neo4j_uri}")
-            self._init_schema()
-        except Exception as e:
-            logger.warning(f"Neo4j unavailable: {e}. Falling back to in-memory graph.")
-            self._driver = None
+    def _connect(self, retries=3, delay=5):
+        for attempt in range(retries):
+            try:
+                self._driver = GraphDatabase.driver(
+                    settings.neo4j_uri,
+                    auth=(settings.neo4j_user, settings.neo4j_password),
+                )
+                self._driver.verify_connectivity()
+                logger.info(f"Connected to Neo4j at {settings.neo4j_uri}")
+                self._init_schema()
+                return
+            except Exception as e:
+                if attempt < retries - 1:
+                    logger.warning(f"Neo4j attempt {attempt+1}/{retries} failed: {e}. Retrying in {delay}s...")
+                    import time; time.sleep(delay)
+                else:
+                    logger.warning(f"Neo4j unavailable after {retries} attempts: {e}. Falling back to in-memory graph.")
+                    self._driver = None
 
     def _init_schema(self):
         if not self._driver:

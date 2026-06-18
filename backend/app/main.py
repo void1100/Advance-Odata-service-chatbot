@@ -712,38 +712,104 @@ async def chat(payload: ChatRequest, request: Request):
 
     add_message(session_id, "user", payload.query)
 
+    # Query cache check
+    from app.services.query_enhancements import query_cache, summarize_results, recommend_charts, get_drill_down_links
+    cached_result = query_cache.get(payload.query, session_id)
+    if cached_result:
+        cached_result["cached"] = True
+        return ChatResponse(**cached_result)
+
     # Direct prediction detection (bypass LLM for prediction queries)
     from app.services.model_store import model_store
     query_lower = payload.query.lower()
     prediction_keywords = ["predict", "what will", "forecast", "estimate", "project"]
-    is_prediction = any(kw in query_lower for kw in prediction_keywords) and ("if" in query_lower or "given" in query_lower or "when" in query_lower)
-    
+    is_prediction = any(kw in query_lower for kw in prediction_keywords)
+
     if is_prediction:
         models = model_store.list_models()
-        if models:
-            # Find best matching model
-            best_model = None
+        if not models:
+            # No trained model exists — guide user
+            return ChatResponse(
+                run_id=str(uuid.uuid4()),
+                session_id=session_id,
+                user_query=payload.query,
+                user_role=user_role,
+                summary=(
+                    "I don't have a trained model yet for predictions. "
+                    "First, query the data (e.g. 'Show me products'), "
+                    "then I can train a model and make predictions. "
+                    "You can also explicitly train via the ML panel."
+                ),
+                plan={"intent": "predict", "note": "no_model"},
+                discovery=None,
+                tool_calls=[],
+                blocked_steps=[],
+                table=None,
+                primary_url=None,
+                primary_service=None,
+                error=None,
+                memory_used=[],
+                llm_provider="model_store",
+                llm_latency_ms=0,
+                llm_tokens=0,
+            )
+
+        # Find best matching model: prefer target column in query, then entity name match
+        best_model = None
+        # Priority 1: target column mentioned in query (e.g. "discontinued" → Discontinued model)
+        for m in models:
+            target = m.get("target_column", "").lower()
+            if target and target in query_lower:
+                best_model = m
+                break
+        # Priority 2: entity name segments match query
+        if not best_model:
             for m in models:
                 ek = m["entity_key"].lower()
-                if any(word in query_lower for word in ek.split("_")):
+                ek_parts = [p for p in ek.split("_") if len(p) > 2]
+                if any(part in query_lower for part in ek_parts):
                     best_model = m
                     break
-            if not best_model:
-                best_model = models[0]
-            
-            # Extract feature values from query (simple heuristic)
-            features = {}
-            import re
-            for m in models:
-                for feat in m.get("feature_columns", []):
-                    # Match patterns like "CategoryID is 2", "CategoryID = 2", "CategoryID 2"
-                    pattern = rf'{re.escape(feat)}\s*(?:is|=|equals)?\s*(\d+\.?\d*)'
-                    match = re.search(pattern, payload.query, re.IGNORECASE)
-                    if match:
-                        features[feat] = float(match.group(1))
-            
-            pred_result = model_store.predict(best_model["entity_key"], features)
-            if pred_result:
+        # Priority 3: first model
+        if not best_model:
+            best_model = models[0]
+
+        # Extract feature values from query (enhanced patterns)
+        import re
+        features = {}
+        for feat in best_model.get("feature_columns", []):
+            feat_esc = re.escape(feat)
+            # Pattern 1: "UnitPrice is 88" / "UnitPrice = 88" / "UnitPrice 88"
+            pattern1 = rf'{feat_esc}\s*(?:is|=|equals|[:=])\s*(\d+\.?\d*)'
+            match1 = re.search(pattern1, payload.query, re.IGNORECASE)
+            if match1:
+                features[feat] = float(match1.group(1))
+                continue
+            # Pattern 2: "UnitPrice: 88" or "unitprice 88"
+            pattern2 = rf'{feat_esc}\s+(\d+\.?\d*)'
+            match2 = re.search(pattern2, payload.query, re.IGNORECASE)
+            if match2:
+                features[feat] = float(match2.group(1))
+                continue
+            # Pattern 3: "with UnitPrice 88" or "where UnitPrice is 88"
+            pattern3 = rf'(?:with|where|and)\s+{feat_esc}\s+(?:is\s+)?(\d+\.?\d*)'
+            match3 = re.search(pattern3, payload.query, re.IGNORECASE)
+            if match3:
+                features[feat] = float(match3.group(1))
+
+        if not features:
+            # Could not extract any features — try fallback from /ml/predict style input
+            # Parse "product X with unitprice Y and UnitsInStock Z"
+            all_numbers = re.findall(r'(\d+\.?\d*)', payload.query)
+            numeric_feats = [f for f in best_model.get("feature_columns", [])
+                            if best_model.get("task_type") == "regression" or not f.lower() in ("discontinued",)]
+            for i, val in enumerate(all_numbers[:len(numeric_feats)]):
+                features[numeric_feats[i]] = float(val)
+
+        logger.info(f"Prediction: model={best_model['entity_key']}, features={features}")
+
+        pred_result = model_store.predict(best_model["entity_key"], features)
+        if pred_result:
                 tool_calls = [{
                     "type": "prediction",
                     "entity_key": best_model["entity_key"],
@@ -751,13 +817,28 @@ async def chat(payload: ChatRequest, request: Request):
                     "prediction": pred_result["prediction"],
                     "confidence": pred_result["confidence_info"],
                     "features": pred_result["features_used"],
+                    "task_type": pred_result.get("task_type", "regression"),
                 }]
-                summary = (
-                    f"Predicted **{pred_result['target_column']}** = **{pred_result['prediction']:.2f}** "
-                    f"based on {pred_result['features_used']}. "
-                    f"{pred_result['confidence_info']}. "
-                    f"*(Model: {best_model['algorithm']}, trained on {best_model['sample_count']} samples)*"
-                )
+                pred_val = pred_result["prediction"]
+                target = pred_result["target_column"]
+                # Format classification results with labels
+                if pred_result.get("task_type") == "classification":
+                    # Threshold at 0.5 for binary classification
+                    label = "Yes" if pred_val >= 0.5 else "No"
+                    confidence_pct = pred_val * 100 if pred_val >= 0.5 else (1 - pred_val) * 100
+                    summary = (
+                        f"**{target}** predicted as **{label}** "
+                        f"(confidence: {confidence_pct:.0f}%). "
+                        f"Based on features: {pred_result['features_used']}. "
+                        f"*(Model: {best_model['algorithm']}, trained on {best_model['sample_count']} samples)*"
+                    )
+                else:
+                    summary = (
+                        f"Predicted **{target}** = **{pred_val:.2f}** "
+                        f"based on {pred_result['features_used']}. "
+                        f"{pred_result['confidence_info']}. "
+                        f"*(Model: {best_model['algorithm']}, trained on {best_model['sample_count']} samples)*"
+                    )
                 return ChatResponse(
                     run_id=str(uuid.uuid4()),
                     session_id=session_id,
@@ -777,6 +858,66 @@ async def chat(payload: ChatRequest, request: Request):
                     llm_latency_ms=0,
                     llm_tokens=0,
                 )
+
+    # Multi-entity aggregation (e.g., sales by country needs Customers+Orders+Order_Details)
+    from app.services.multi_entity_aggregator import detect_multi_entity_query, execute_multi_entity_aggregation
+    services_list = service_manager.list_services()
+    for svc in services_list:
+        svc_id = svc["id"]
+        client = service_manager.get_client(svc_id)
+        if not client:
+            continue
+        entity_cols = {}
+        for es in svc.get("entity_sets", []):
+            # Dynamic view detection: skip entities that are likely views/queries
+            es_lower = es.lower()
+            if any(vp in es_lower for vp in ("summary", "by_", "for_", "list_of", "extended", "subtotal", "quarterly", "annual")):
+                continue
+            try:
+                raw = await client.query(entity_set=es, top=1)
+                flat = client.flatten_odata_value(raw)
+                if flat:
+                    entity_cols[es] = [c for c in flat[0].keys() if not c.startswith("@odata")]
+            except Exception:
+                pass
+        if not entity_cols:
+            continue
+        me_info = detect_multi_entity_query(payload.query, svc_id, entity_cols)
+        if me_info:
+            client = service_manager.get_client(svc_id)
+            if client:
+                me_result = await execute_multi_entity_aggregation(
+                    payload.query, svc_id, client, me_info,
+                )
+                if me_result:
+                    tool_calls_me = [{"type": "multi_entity", "service_id": svc_id, "chain": [s["entity"] for s in me_info["chain"]], "row_count": me_result["row_count"]}]
+                    add_message(session_id, "assistant", me_result.get("summary", ""), plan=None, result={"table": me_result, "tool_calls": tool_calls_me})
+                    # Generate chart recommendations for multi-entity results
+                    me_chart_recs = []
+                    try:
+                        me_chart_recs = recommend_charts(me_result.get("rows", []), me_result.get("columns", []), payload.query)
+                    except Exception:
+                        pass
+                    return ChatResponse(
+                        run_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        user_query=payload.query,
+                        user_role=user_role,
+                        summary=me_result.get("summary", "Multi-entity aggregation complete"),
+                        plan={"intent": "aggregate", "summary": me_result.get("summary", "")},
+                        discovery=None,
+                        tool_calls=tool_calls_me,
+                        blocked_steps=[],
+                        table=TableData(**me_result) if me_result else None,
+                        primary_url=None,
+                        primary_service=svc["id"],
+                        error=None,
+                        memory_used=[],
+                        llm_provider="computed",
+                        llm_latency_ms=0,
+                        llm_tokens=0,
+                        chart_recommendations=me_chart_recs,
+                    )
 
     result = await orchestrator.run(
         user_query=payload.query,
@@ -847,7 +988,11 @@ async def chat(payload: ChatRequest, request: Request):
             table_obj = TableData(**pp_result)
             pp_type = pp_info.get("type", "")
             if pp_type == "percentage":
-                result["summary"] = f"Percentage breakdown ({pp_result['row_count']} groups)"
+                min_pct = pp_info.get("min_percentage")
+                if min_pct is not None:
+                    result["summary"] = f"Percentage breakdown ({pp_result['row_count']} groups with > {min_pct}% contribution)"
+                else:
+                    result["summary"] = f"Percentage breakdown ({pp_result['row_count']} groups)"
             elif pp_type == "comparison":
                 result["summary"] = f"Comparison result ({pp_result['row_count']} entries)"
             elif pp_type in ("which_extremum", "extremum"):
@@ -876,7 +1021,9 @@ async def chat(payload: ChatRequest, request: Request):
                 try:
                     vals = [float(r[col]) for r in rows if r.get(col) is not None]
                     if len(vals) >= 5 and len(set(vals)) > 1:
-                        entity_key = f"{result.get('primary_service', 'unknown')}_{result.get('plan', {}).get('steps', [{}])[0].get('entity_set', 'data')}"
+                        plan_data = result.get('plan') or {}
+                        entity_set = (plan_data.get('steps') or [{}])[0].get('entity_set', 'data') if plan_data.get('steps') else 'data'
+                        entity_key = f"{result.get('primary_service', 'unknown')}_{entity_set}"
                         train_result = train_model(rows, cols, col, "random_forest")
                         if "_model" in train_result:
                             model_store.store(
@@ -897,6 +1044,62 @@ async def chat(payload: ChatRequest, request: Request):
         except Exception as e:
             logger.warning(f"Auto-training failed: {e}")
 
+    # Generate chart recommendations and drill-down links
+    chart_recs = []
+    drill_links = []
+    if result.get("table") and result["table"].get("rows"):
+        try:
+            t = result["table"]
+            chart_recs = recommend_charts(t["rows"], t["columns"], payload.query)
+        except Exception as e:
+            logger.warning(f"Chart recommendation failed: {e}")
+        try:
+            if t["rows"]:
+                # Extract entity_set from plan (Pydantic or dict)
+                entity_set_name = ""
+                plan_data = plan_obj if plan_obj else result.get("plan")
+                if plan_data:
+                    steps = getattr(plan_data, "steps", None) or (plan_data.get("steps") if isinstance(plan_data, dict) else None)
+                    if steps and len(steps) > 0:
+                        step = steps[0]
+                        entity_set_name = getattr(step, "entity_set", "") or (step.get("entity_set") if isinstance(step, dict) else "")
+                drill_links = get_drill_down_links(
+                    entity_set_name,
+                    t["rows"][0],
+                    service_manager.list_services(),
+                )
+        except Exception as e:
+            logger.warning(f"Drill-down link generation failed: {e}")
+
+    # Cache the result (only if it has meaningful table data)
+    try:
+        table_data = result.get("table")
+        has_table = table_data and table_data.get("rows") and len(table_data.get("rows", [])) > 0
+        response_data = {
+            "run_id": result["run_id"],
+            "session_id": session_id,
+            "user_query": result["user_query"],
+            "user_role": result["user_role"],
+            "summary": result["summary"],
+            "plan": plan_obj.model_dump() if plan_obj else None,
+            "discovery": result.get("discovery"),
+            "tool_calls": result.get("tool_calls", []),
+            "blocked_steps": result.get("blocked_steps", []),
+            "table": table_data if has_table else None,
+            "primary_url": result.get("primary_url"),
+            "primary_service": result.get("primary_service"),
+            "error": result.get("error"),
+            "memory_used": result.get("memory_used", []),
+            "llm_provider": result.get("llm_provider", "unknown"),
+            "llm_latency_ms": result.get("llm_latency_ms", 0),
+            "llm_tokens": result.get("llm_tokens", 0),
+            "chart_recommendations": chart_recs,
+            "drill_down_links": drill_links,
+        }
+        query_cache.set(payload.query, response_data, session_id)
+    except Exception:
+        pass
+
     return ChatResponse(
         run_id=result["run_id"],
         session_id=session_id,
@@ -915,7 +1118,28 @@ async def chat(payload: ChatRequest, request: Request):
         llm_provider=result.get("llm_provider", "unknown"),
         llm_latency_ms=result.get("llm_latency_ms", 0),
         llm_tokens=result.get("llm_tokens", 0),
+        chart_recommendations=chart_recs,
+        drill_down_links=drill_links,
     )
+
+
+@app.get("/suggestions")
+async def get_suggestions():
+    from app.services.query_enhancements import generate_suggestions
+    return {"suggestions": generate_suggestions(service_manager.list_services())}
+
+
+@app.get("/cache/stats")
+async def get_cache_stats():
+    from app.services.query_enhancements import query_cache
+    return query_cache.stats()
+
+
+@app.post("/cache/clear")
+async def clear_cache():
+    from app.services.query_enhancements import query_cache
+    query_cache.clear()
+    return {"ok": True}
 
 
 @app.get("/sessions", response_model=List[SessionInfo])

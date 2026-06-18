@@ -152,7 +152,8 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
     const latency = result.llm.latency_ms != null ? `${result.llm.latency_ms}ms` : "?";
     const tokens = result.llm.tokens ? ` · ${result.llm.tokens} tokens` : "";
     const corrected = result.llm.corrected ? " · self-corrected" : "";
-    badge.textContent = `LLM: ${provider} · ${latency}${tokens}${corrected}`;
+    const cached = result.cached ? " · ⚡ cached" : "";
+    badge.textContent = `LLM: ${provider} · ${latency}${tokens}${corrected}${cached}`;
     div.appendChild(badge);
   }
   const isExtremumAnswer = summary && (summary.startsWith("Least:") || summary.startsWith("Most:"));
@@ -166,6 +167,27 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
       requestAnimationFrame(() => panel.renderGraph());
     }
   }
+  // Chart recommendations
+  if (result && result.chart_recommendations && result.chart_recommendations.length) {
+    const chartDiv = document.createElement("div");
+    chartDiv.className = "chart-recommendations";
+    chartDiv.innerHTML = '<div class="section-label">Suggested Charts</div>' +
+      result.chart_recommendations.map(c => {
+        const icon = c.type === 'pie' ? '🥧' : c.type === 'bar' ? '📊' : c.type === 'line' ? '📈' : c.type === 'scatter' ? '⚬' : '📋';
+        return `<button class="chart-rec-btn" data-config='${escapeHtml(JSON.stringify(c))}' title="Confidence: ${c.confidence}">${icon} ${escapeHtml(c.title)}</button>`;
+      }).join("");
+    div.appendChild(chartDiv);
+  }
+  // Drill-down links
+  if (result && result.drill_down_links && result.drill_down_links.length) {
+    const drillDiv = document.createElement("div");
+    drillDiv.className = "drill-down-container";
+    drillDiv.innerHTML = '<div class="section-label">Related Data</div>' +
+      result.drill_down_links.map(l =>
+        `<button class="drill-chip" data-query="${escapeHtml(l.query)}" title="${escapeHtml(l.description)}">${escapeHtml(l.entity)} → ${escapeHtml(l.via_column)}=${escapeHtml(l.via_value)}</button>`
+      ).join("");
+    div.appendChild(drillDiv);
+  }
   if (result && result.tool_calls && result.tool_calls.length) {
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -175,7 +197,16 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
         return `<span class="tool-pill">${escapeHtml(t.service_id)}/${escapeHtml(t.entity_set)}</span> ${t.row_count} rows${correctedTag}<div class="url-line">${escapeHtml(t.url || "")}</div>`;
       }
       if (t.type === "prediction") {
-        return `<span class="tool-pill" style="background:#3b82f6;color:white">prediction</span> <strong>${escapeHtml(t.target)}</strong> = <strong>${escapeHtml(String(t.prediction))}</strong> <span style="opacity:0.6">${escapeHtml(t.confidence || "")}</span><div class="url-line">Features: ${escapeHtml(JSON.stringify(t.features || {}))}</div>`;
+        let displayVal = String(t.prediction);
+        let confText = t.confidence || "";
+        if (t.task_type === "classification") {
+          const prob = Number(t.prediction);
+          const label = prob >= 0.5 ? "Yes" : "No";
+          const confPct = prob >= 0.5 ? (prob * 100).toFixed(0) : ((1 - prob) * 100).toFixed(0);
+          displayVal = label;
+          confText = `(confidence: ${confPct}%)`;
+        }
+        return `<span class="tool-pill" style="background:#3b82f6;color:white">prediction</span> <strong>${escapeHtml(t.target)}</strong> = <strong>${escapeHtml(displayVal)}</strong> <span style="opacity:0.6">${escapeHtml(confText)}</span><div class="url-line">Features: ${escapeHtml(JSON.stringify(t.features || {}))}</div>`;
       }
       return `<span class="tool-pill">error</span> ${escapeHtml(t.error || "")}`;
     }).join("");
@@ -1514,6 +1545,85 @@ queryInput.addEventListener("keydown", (e) => {
     send();
   }
 });
+
+// Event delegation for chart recommendations and drill-down chips
+messagesEl.addEventListener("click", (e) => {
+  const chartBtn = e.target.closest(".chart-rec-btn");
+  if (chartBtn) {
+    try {
+      const config = JSON.parse(chartBtn.dataset.config);
+      showChartRecommendation(config);
+    } catch (err) {}
+    return;
+  }
+  const drillBtn = e.target.closest(".drill-chip");
+  if (drillBtn) {
+    queryInput.value = drillBtn.dataset.query;
+    send();
+    return;
+  }
+});
+
+function showChartRecommendation(config) {
+  const lastBubble = messagesEl.querySelector(".bubble.assistant:last-child");
+  if (!lastBubble) return;
+  const graphCanvas = lastBubble.querySelector("#graph-canvas");
+  if (!graphCanvas) return;
+  const graphTab = lastBubble.querySelector('[data-tab="graph"]');
+  if (graphTab) graphTab.click();
+}
+
+// ─── Query Suggestions / Autocomplete ─────────────────────────────────────────
+const suggestionsDropdown = document.getElementById("suggestionsDropdown");
+let allSuggestions = [];
+
+async function loadSuggestions() {
+  try {
+    const resp = await api("/suggestions");
+    allSuggestions = resp.suggestions || [];
+  } catch (e) {}
+}
+
+function showSuggestions(query) {
+  if (!suggestionsDropdown || !query || query.length < 2) {
+    if (suggestionsDropdown) suggestionsDropdown.classList.add("hidden");
+    return;
+  }
+  const q = query.toLowerCase();
+  const matches = allSuggestions.filter(s =>
+    s.query.toLowerCase().includes(q) || s.description.toLowerCase().includes(q)
+  ).slice(0, 8);
+  if (matches.length === 0) {
+    suggestionsDropdown.classList.add("hidden");
+    return;
+  }
+  suggestionsDropdown.innerHTML = matches.map(s =>
+    `<div class="suggestion-item" data-query="${escapeHtml(s.query)}">
+      <span class="suggestion-query">${escapeHtml(s.query)}</span>
+      <span class="suggestion-desc">${escapeHtml(s.description)}</span>
+    </div>`
+  ).join("");
+  suggestionsDropdown.classList.remove("hidden");
+}
+
+if (suggestionsDropdown) {
+  suggestionsDropdown.addEventListener("click", (e) => {
+    const item = e.target.closest(".suggestion-item");
+    if (item) {
+      queryInput.value = item.dataset.query;
+      suggestionsDropdown.classList.add("hidden");
+      queryInput.focus();
+    }
+  });
+}
+
+queryInput.addEventListener("input", () => showSuggestions(queryInput.value));
+queryInput.addEventListener("blur", () => {
+  setTimeout(() => suggestionsDropdown && suggestionsDropdown.classList.add("hidden"), 200);
+});
+
+loadSuggestions();
+
 newChatBtn.addEventListener("click", () => {
   currentSessionId = null;
   messagesEl.innerHTML = emptyStateHtml();

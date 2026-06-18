@@ -167,6 +167,8 @@ class Orchestrator:
         if plan.get("intent") == "predict" and plan.get("prediction"):
             pred = plan["prediction"]
             entity_key = pred.get("entity_key", "")
+            if isinstance(entity_key, list):
+                entity_key = entity_key[0] if entity_key else ""
             features = pred.get("features", {})
             target = pred.get("target", "")
             from app.services.model_store import model_store
