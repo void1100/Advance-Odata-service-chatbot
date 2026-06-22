@@ -30,12 +30,37 @@ def _strip_ns(tag: str) -> str:
 
 
 class ODataClient:
-    def __init__(self, base_url: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, timeout: float = 30.0, auth_type: str = None, auth_config: Dict[str, str] = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._metadata_cache: Optional[Dict[str, Any]] = None
         self._sampled: bool = False
         self._client: Optional[httpx.AsyncClient] = None
+        self._auth_type = auth_type
+        self._auth_config = auth_config or {}
+
+    def _get_auth_headers(self) -> Dict[str, str]:
+        headers = {}
+        if self._auth_type == "basic" and self._auth_config:
+            import base64
+            user = self._auth_config.get("username", "")
+            pwd = self._auth_config.get("password", "")
+            if user:
+                token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+                headers["Authorization"] = f"Basic {token}"
+                logger.info(f"OData auth: Basic Auth for user '{user}'")
+        elif self._auth_type == "bearer" and self._auth_config:
+            token = self._auth_config.get("token", "")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+                logger.info(f"OData auth: Bearer token")
+        elif self._auth_type == "api_key" and self._auth_config:
+            key_name = self._auth_config.get("header_name", "X-API-Key")
+            key_value = self._auth_config.get("api_key", "")
+            if key_value:
+                headers[key_name] = key_value
+                logger.info(f"OData auth: API Key in '{key_name}'")
+        return headers
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -45,9 +70,18 @@ class ODataClient:
     async def get_metadata(self, force_refresh: bool = False) -> Dict[str, Any]:
         if self._metadata_cache and not force_refresh:
             return self._metadata_cache
-        url = f"{self.base_url}/$metadata"
+        # SAP CPI pattern: metadata=true in query returns XML at service root
+        if "metadata=true" in self.base_url.lower():
+            url = self.base_url
+        elif "?" in self.base_url:
+            base, qs = self.base_url.split("?", 1)
+            url = f"{base}/$metadata?{qs}"
+        else:
+            url = f"{self.base_url}/$metadata"
         client = await self._get_client()
-        resp = await client.get(url, headers={"Accept": "application/xml"})
+        headers = {"Accept": "application/xml"}
+        headers.update(self._get_auth_headers())
+        resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         xml_text = resp.text
         meta = self._parse_metadata(xml_text)
@@ -63,29 +97,35 @@ class ODataClient:
         namespace = ""
 
         schemas = list(root.iter(f"{{{NS['schema']}}}Schema"))
+        edm_ns = NS['schema']
         if not schemas:
             for child in root.iter():
                 if _strip_ns(child.tag) == "Schema":
                     schemas.append(child)
+                    # Detect which namespace is used
+                    ns_uri = child.tag.split("}")[0].lstrip("{") if "}" in child.tag else ""
+                    if ns_uri:
+                        edm_ns = ns_uri
+                    break
 
         for schema in schemas:
             ns = schema.attrib.get("Namespace", "")
             if not namespace:
                 namespace = ns
-            for et in schema.findall(f"{{{NS['schema']}}}EntityType"):
+            for et in schema.findall(f"{{{edm_ns}}}EntityType"):
                 name = et.attrib.get("Name")
                 if not name:
                     continue
                 props = []
-                for prop in et.findall(f"{{{NS['schema']}}}Property"):
+                for prop in et.findall(f"{{{edm_ns}}}Property"):
                     props.append({
                         "name": prop.attrib.get("Name"),
                         "type": prop.attrib.get("Type"),
                         "nullable": prop.attrib.get("Nullable", "true") == "true",
                     })
-                keys = [n.text for n in et.findall(f"{{{NS['schema']}}}Key/{{{NS['schema']}}}PropertyRef")]
+                keys = [n.text for n in et.findall(f"{{{edm_ns}}}Key/{{{edm_ns}}}PropertyRef")]
                 nav_props = []
-                for nav in et.findall(f"{{{NS['schema']}}}NavigationProperty"):
+                for nav in et.findall(f"{{{edm_ns}}}NavigationProperty"):
                     nav_props.append({
                         "name": nav.attrib.get("Name"),
                         "type": nav.attrib.get("Type"),
@@ -99,15 +139,26 @@ class ODataClient:
                     "navigation_properties": nav_props,
                 }
 
-        for container in root.iter(f"{{{NS['schema']}}}EntityContainer"):
-            for es in container.findall(f"{{{NS['schema']}}}EntitySet"):
+        for container in root.iter(f"{{{edm_ns}}}EntityContainer"):
+            for es in container.findall(f"{{{edm_ns}}}EntitySet"):
                 entity_sets.append({
                     "name": es.attrib.get("Name"),
                     "entity_type": es.attrib.get("EntityType"),
                 })
 
-        for assoc in root.iter(f"{{{NS['schema']}}}Association"):
-            ends = assoc.findall(f"{{{NS['schema']}}}End")
+        # Fallback: namespace-agnostic EntityContainer detection
+        if not entity_sets:
+            for container in root.iter():
+                if _strip_ns(container.tag) == "EntityContainer":
+                    for es in container:
+                        if _strip_ns(es.tag) == "EntitySet":
+                            entity_sets.append({
+                                "name": es.attrib.get("Name"),
+                                "entity_type": es.attrib.get("EntityType"),
+                            })
+
+        for assoc in root.iter(f"{{{edm_ns}}}Association"):
+            ends = assoc.findall(f"{{{edm_ns}}}End")
             if len(ends) >= 2:
                 associations.append({
                     "name": assoc.attrib.get("Name"),
@@ -198,6 +249,30 @@ class ODataClient:
                 return et
         return None
 
+    def _get_data_base_url(self) -> str:
+        """Get base URL for data queries (strip query params for SAP CPI)."""
+        import re
+        url = self.base_url
+        if self._is_sap_cpi():
+            # Strip all query params — they'll be rebuilt by _build_sap_cpi_url
+            if "?" in url:
+                url = url.split("?")[0]
+        elif "metadata=true" in url.lower():
+            url = re.sub(r'[&?]metadata=true', '', url, flags=re.IGNORECASE)
+            url = re.sub(r'\?$', '', url)
+        return url
+
+    def _is_sap_cpi(self) -> bool:
+        """Detect SAP CPI pattern (service= param or metadata=true)."""
+        url = self.base_url.lower()
+        return "service=" in url or "metadata=true" in url
+
+    def _get_sap_service_name(self) -> str:
+        """Extract SAP CPI service name from URL (e.g. API_PURCHASEORDER_PROCESS_SRV)."""
+        import re
+        m = re.search(r'service=([^&]+)', self.base_url, re.IGNORECASE)
+        return m.group(1) if m else ""
+
     def _build_url(
         self,
         entity_set: str,
@@ -209,6 +284,8 @@ class ODataClient:
         orderby: Optional[str] = None,
         count: bool = False,
     ) -> str:
+        if self._is_sap_cpi():
+            return self._build_sap_cpi_url(entity_set, top=top)
         params: List[Tuple[str, str]] = []
         if select:
             params.append(("$select", ",".join(select)))
@@ -225,7 +302,17 @@ class ODataClient:
         if count:
             params.append(("$count", "true"))
         qs = urlencode(params)
-        return f"{self.base_url}/{entity_set}{'?' + qs if qs else ''}"
+        return f"{self._get_data_base_url()}/{entity_set}{'?' + qs if qs else ''}"
+
+    def _build_sap_cpi_url(self, entity_set: str, top: Optional[int] = None) -> str:
+        """Build SAP CPI data URL: base?service=X&entity=Y&top=N"""
+        base = self._get_data_base_url()
+        service_name = self._get_sap_service_name()
+        params = [("service", service_name), ("entity", entity_set)]
+        if top is not None:
+            params.append(("top", str(top)))
+        qs = urlencode(params)
+        return f"{base}?{qs}"
 
     async def query(
         self,
@@ -242,16 +329,20 @@ class ODataClient:
             expand=expand, top=top, skip=skip, orderby=orderby, count=True,
         )
         client = await self._get_client()
-        resp = await client.get(url, headers={"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        headers.update(self._get_auth_headers())
+        resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         data = resp.json()
         return data
 
     async def get_by_id(self, entity_set: str, entity_id: str, select: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         qs = f"?$select={','.join(select)}" if select else ""
-        url = f"{self.base_url}/{entity_set}({entity_id}){qs}"
+        url = f"{self._get_data_base_url()}/{entity_set}({entity_id}){qs}"
         client = await self._get_client()
-        resp = await client.get(url, headers={"Accept": "application/json"})
+        headers = {"Accept": "application/json"}
+        headers.update(self._get_auth_headers())
+        resp = await client.get(url, headers=headers)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -261,6 +352,11 @@ class ODataClient:
     def flatten_odata_value(value: Any) -> List[Dict[str, Any]]:
         if isinstance(value, dict) and "value" in value:
             return value["value"]
+        if isinstance(value, dict):
+            # SAP CPI wraps data as {"EntityType": [...]}
+            for v in value.values():
+                if isinstance(v, list):
+                    return v
         if isinstance(value, list):
             return value
         return []

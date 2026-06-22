@@ -40,8 +40,11 @@ function setStatus(ok, text) {
 }
 
 async function api(path, opts = {}) {
+  const token = localStorage.getItem("admin_token");
+  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+    headers,
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
@@ -145,6 +148,7 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
   const div = document.createElement("div");
   div.className = "bubble assistant";
   div.textContent = summary || "Done.";
+  try {
   if (result && result.llm) {
     const badge = document.createElement("div");
     badge.className = `llm-badge llm-${result.llm.provider}`;
@@ -153,7 +157,8 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
     const tokens = result.llm.tokens ? ` · ${result.llm.tokens} tokens` : "";
     const corrected = result.llm.corrected ? " · self-corrected" : "";
     const cached = result.cached ? " · ⚡ cached" : "";
-    badge.textContent = `LLM: ${provider} · ${latency}${tokens}${corrected}${cached}`;
+    const intent = result.llm.intent ? ` · ${result.llm.intent}` : "";
+    badge.textContent = `LLM: ${provider} · ${latency}${tokens}${corrected}${cached}${intent}`;
     div.appendChild(badge);
   }
   const isExtremumAnswer = summary && (summary.startsWith("Least:") || summary.startsWith("Most:"));
@@ -164,7 +169,7 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
       div.appendChild(panel.panelEl);
       tableWrap.style.display = "";
       panel.tableView.appendChild(tableWrap);
-      requestAnimationFrame(() => panel.renderGraph());
+      requestAnimationFrame(() => { try { panel.renderGraph(); } catch(e) { console.error("Graph render error:", e); } });
     }
   }
   // Chart recommendations
@@ -189,29 +194,42 @@ function addAssistantBubble(summary, result, scroll = true, paginationInfo = nul
     div.appendChild(drillDiv);
   }
   if (result && result.tool_calls && result.tool_calls.length) {
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.innerHTML = result.tool_calls.map((t) => {
-      if (t.type === "odata.query") {
-        const correctedTag = t.corrected ? ` <span class="tool-pill corrected">corrected</span>` : "";
-        return `<span class="tool-pill">${escapeHtml(t.service_id)}/${escapeHtml(t.entity_set)}</span> ${t.row_count} rows${correctedTag}<div class="url-line">${escapeHtml(t.url || "")}</div>`;
-      }
-      if (t.type === "prediction") {
-        let displayVal = String(t.prediction);
-        let confText = t.confidence || "";
-        if (t.task_type === "classification") {
-          const prob = Number(t.prediction);
-          const label = prob >= 0.5 ? "Yes" : "No";
-          const confPct = prob >= 0.5 ? (prob * 100).toFixed(0) : ((1 - prob) * 100).toFixed(0);
-          displayVal = label;
-          confText = `(confidence: ${confPct}%)`;
+    const hasQuery = result.tool_calls.some(t => t.type === "odata.query");
+    if (hasQuery) {
+      const metaToggle = document.createElement("div");
+      metaToggle.className = "meta-toggle";
+      metaToggle.textContent = "Details";
+      metaToggle.title = "Show/hide query details";
+      const meta = document.createElement("div");
+      meta.className = "meta meta-hidden";
+      meta.innerHTML = result.tool_calls.map((t) => {
+        if (t.type === "odata.query") {
+          const correctedTag = t.corrected ? ` <span class="tool-pill corrected">corrected</span>` : "";
+          return `<span class="tool-pill">${escapeHtml(t.service_id)}/${escapeHtml(t.entity_set)}</span> ${t.row_count} rows${correctedTag}<div class="url-line">${escapeHtml(t.url || "")}</div>`;
         }
-        return `<span class="tool-pill" style="background:#3b82f6;color:white">prediction</span> <strong>${escapeHtml(t.target)}</strong> = <strong>${escapeHtml(displayVal)}</strong> <span style="opacity:0.6">${escapeHtml(confText)}</span><div class="url-line">Features: ${escapeHtml(JSON.stringify(t.features || {}))}</div>`;
-      }
-      return `<span class="tool-pill">error</span> ${escapeHtml(t.error || "")}`;
-    }).join("");
-    div.appendChild(meta);
+        if (t.type === "prediction") {
+          let displayVal = String(t.prediction);
+          let confText = t.confidence || "";
+          if (t.task_type === "classification") {
+            const prob = Number(t.prediction);
+            const label = prob >= 0.5 ? "Yes" : "No";
+            const confPct = prob >= 0.5 ? (prob * 100).toFixed(0) : ((1 - prob) * 100).toFixed(0);
+            displayVal = label;
+            confText = `(confidence: ${confPct}%)`;
+          }
+          return `<span class="tool-pill" style="background:#3b82f6;color:white">prediction</span> <strong>${escapeHtml(t.target)}</strong> = <strong>${escapeHtml(displayVal)}</strong> <span style="opacity:0.6">${escapeHtml(confText)}</span>`;
+        }
+        return `<span class="tool-pill">error</span> ${escapeHtml(t.error || "")}`;
+      }).join("");
+      metaToggle.addEventListener("click", () => {
+        meta.classList.toggle("meta-hidden");
+        metaToggle.textContent = meta.classList.contains("meta-hidden") ? "Details" : "Hide";
+      });
+      div.appendChild(metaToggle);
+      div.appendChild(meta);
+    }
   }
+  } catch(e) { console.error("Bubble render error:", e); }
   messagesEl.appendChild(div);
   if (scroll) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -1492,6 +1510,20 @@ const themeObserver = new MutationObserver(() => {
 });
 themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
+function addProcessingBubble(text) {
+  const div = document.createElement("div");
+  div.className = "bubble assistant processing-bubble";
+  div.innerHTML = `<span class="processing-text">${escapeHtml(text)}</span><span class="typing-dots"><span></span><span></span><span></span></span>`;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div;
+}
+
+function removeProcessingBubble() {
+  const el = messagesEl.querySelector(".processing-bubble");
+  if (el) el.remove();
+}
+
 async function send() {
   if (isLoading) return;
   const q = queryInput.value.trim();
@@ -1505,6 +1537,7 @@ async function send() {
   if (messagesEl.querySelector(".empty-state")) messagesEl.innerHTML = "";
   addUserBubble(q);
   queryInput.value = "";
+  const processingEl = addProcessingBubble("Processing your query...");
   try {
     const resp = await api("/chat", {
       method: "POST",
@@ -1514,6 +1547,7 @@ async function send() {
         user_role: roleSelect.value,
       },
     });
+    removeProcessingBubble();
     currentSessionId = resp.session_id;
     lastSummary = resp.summary;
     lastTable = resp.table;
@@ -1525,10 +1559,12 @@ async function send() {
         latency_ms: resp.llm_latency_ms,
         tokens: resp.llm_tokens,
         corrected: (resp.tool_calls || []).some((t) => t.corrected),
+        intent: resp.intent,
       },
     });
     loadSessions();
   } catch (e) {
+    removeProcessingBubble();
     addAssistantBubble("Error: " + e.message, null);
   } finally {
     isLoading = false;
@@ -1746,21 +1782,50 @@ async function loadServices() {
 
 addServiceForm.addEventListener("submit", async (e) => {
   e.preventDefault();
+  const authType = $("svcAuthType").value;
   const payload = {
     id: $("svcId").value.trim(),
     name: $("svcName").value.trim(),
     base_url: $("svcUrl").value.trim(),
     description: $("svcDesc").value.trim(),
+    auth_type: authType || null,
   };
+  if (authType === "basic") {
+    payload.auth_username = $("svcAuthUser").value.trim();
+    payload.auth_password = $("svcAuthPass").value;
+  } else if (authType === "bearer") {
+    payload.auth_token = $("svcAuthToken").value.trim();
+  } else if (authType === "api_key") {
+    payload.auth_api_key = $("svcAuthApiKey").value.trim();
+  }
   if (!payload.id || !payload.name || !payload.base_url) return;
   try {
     await api("/services", { method: "POST", body: payload });
     addServiceForm.reset();
+    $("authFields").classList.add("hidden");
     loadServices();
   } catch (e) {
     alert("Failed to register: " + e.message);
   }
 });
+
+// Auth type toggle
+const svcAuthType = $("svcAuthType");
+if (svcAuthType) {
+  svcAuthType.addEventListener("change", () => {
+    const t = svcAuthType.value;
+    const authFields = $("authFields");
+    const user = $("svcAuthUser");
+    const pass = $("svcAuthPass");
+    const token = $("svcAuthToken");
+    const apiKey = $("svcAuthApiKey");
+    authFields.classList.toggle("hidden", !t);
+    user.classList.toggle("hidden", t !== "basic");
+    pass.classList.toggle("hidden", t !== "basic");
+    token.classList.toggle("hidden", t !== "bearer");
+    apiKey.classList.toggle("hidden", t !== "api_key");
+  });
+}
 
 checkHealth();
 loadSessions();

@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.config import settings
+from app.services.query_optimizer import QueryOptimizer, QueryIntent, query_optimizer
+from app.services.query_rag import query_plan_rag
 
 
 class LLMReasoningEngine:
@@ -43,6 +45,8 @@ class LLMReasoningEngine:
         self.provider = settings.llm_provider
         self.model = settings.llm_model
         self._lock = None
+        self._key_index = 0
+        self.optimizer = query_optimizer
 
     def set_config(self, provider: Optional[str] = None, model: Optional[str] = None) -> None:
         """Update the active LLM provider/model at runtime.
@@ -55,8 +59,87 @@ class LLMReasoningEngine:
             self.model = model
         logger.info(f"LLM config updated: provider={self.provider}, model={self.model}")
 
+    def _get_next_api_key(self) -> str:
+        """Get the next API key from the rotation list."""
+        keys = settings.openai_api_keys_list
+        if not keys:
+            return settings.openai_api_key
+        key = keys[self._key_index % len(keys)]
+        return key
+
+    def _rotate_api_key(self) -> str:
+        """Rotate to the next API key after a rate limit error."""
+        keys = settings.openai_api_keys_list
+        if len(keys) <= 1:
+            return keys[0] if keys else settings.openai_api_key
+        self._key_index = (self._key_index + 1) % len(keys)
+        rotated = keys[self._key_index]
+        logger.info(f"Rotated to API key index {self._key_index}: {rotated[:10]}...")
+        return rotated
+
     def get_config(self) -> Dict[str, Any]:
         return {"provider": self.provider, "model": self.model}
+
+    def _detect_explicit_service(self, services: List[Dict[str, Any]], query: str) -> Optional[str]:
+        """Detect if user explicitly names a service via 'from X' or just mentions the service name.
+        Returns service_id if matched, None otherwise."""
+        import re
+        stop_words = {"where", "and", "with", "show", "get", "list", "filter", "that", "which", "who", "the", "first", "top", "last", "all", "some", "how", "many", "much", "count", "sum", "average", "total", "min", "max", "please", "give", "find"}
+        match = re.search(r'\bfrom\s+(.+?)(?:\s+(?:where|and|with|show|get|list|filter|that|which|who|please|give|find)\b|\s*$)', query, re.IGNORECASE)
+        if match:
+            phrase = match.group(1).strip().lower()
+            words = [w for w in phrase.split() if w not in stop_words and len(w) >= 2]
+            phrase_clean = " ".join(words)
+            for svc in services:
+                if len(phrase_clean) < 2:
+                    continue
+                svc_id = svc["id"].lower()
+                svc_name = svc.get("name", "").lower()
+                if phrase_clean in svc_id or phrase_clean in svc_name:
+                    return svc["id"]
+                if phrase in svc_id or phrase in svc_name:
+                    return svc["id"]
+                svc_name_words = set(re.findall(r'[a-z]{3,}', svc_name))
+                phrase_words = set(words)
+                if len(svc_name_words & phrase_words) >= 2:
+                    return svc["id"]
+
+        for svc in services:
+            svc_id = svc["id"].lower()
+            svc_name_words = set(re.findall(r'[a-z]{3,}', svc.get("name", "").lower()))
+            query_words = set(re.findall(r'[a-z]{3,}', query))
+            if len(svc_name_words & query_words) >= 2:
+                return svc["id"]
+            if svc_id in query:
+                return svc["id"]
+
+        return None
+
+    def _truncate_service_for_llm(self, svc: Dict[str, Any], max_entities: int = 15, max_props_per_entity: int = 8) -> Dict[str, Any]:
+        """Truncate service data to fit within LLM token limits.
+        For large services, send only suggested entity names + limited properties."""
+        entity_props = svc.get("entity_properties", {})
+        entity_sets = svc.get("entity_sets", [])
+
+        if len(entity_sets) <= max_entities:
+            return {
+                "id": svc["id"],
+                "name": svc["name"],
+                "entity_sets": entity_sets,
+                "entity_properties": entity_props,
+            }
+
+        truncated_props = {}
+        for es_name in entity_sets[:max_entities]:
+            props = entity_props.get(es_name, [])
+            truncated_props[es_name] = props[:max_props_per_entity]
+
+        return {
+            "id": svc["id"],
+            "name": svc["name"],
+            "entity_sets": entity_sets,
+            "entity_properties": truncated_props,
+        }
 
     async def plan(
         self,
@@ -64,23 +147,77 @@ class LLMReasoningEngine:
         available_services: List[Dict[str, Any]],
         memory_context: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        explicit_service = self._detect_explicit_service(available_services, query.lower())
+        if explicit_service:
+            filtered = [s for s in available_services if s["id"] == explicit_service]
+            logger.info(f"Explicit service detected: {explicit_service} — calling LLM with filtered services")
+        else:
+            filtered = available_services
+
+        # ── Query Optimizer: intent classification ────────────────────────
+        intent = self.optimizer.classify_intent(query)
+        self.optimizer._stats["intent_classified"] += 1
+        is_complex = self.optimizer._is_complex_query(query.lower())
+        logger.info(f"Query intent: {intent} | complex: {is_complex}")
+
+        # Check cache first
+        service_ids = [s["id"] for s in filtered]
+        cached_plan = self.optimizer.get_cached_plan(query, service_ids)
+        if cached_plan:
+            logger.info("Using cached query plan")
+            return cached_plan, {"provider": "cached", "latency_ms": 0, "tokens": 0}
+
+        # Skip LLM for certain intents with explicit service
+        if explicit_service and self.optimizer.can_skip_llm(intent, has_explicit_service=True, is_complex=is_complex):
+            logger.info(f"Skipping LLM for intent={intent} with explicit service={explicit_service}")
+            self.optimizer._stats["llm_skipped"] += 1
+            t0 = time.perf_counter()
+            plan = self._plan_mock(query, filtered, memory_context)
+            plan = self.optimizer.optimize_plan(plan, query)
+            self.optimizer.cache_plan(query, service_ids, plan)
+            return plan, {"provider": "mock", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": 0, "intent": intent}
+
         if self.provider == "openai" and settings.openai_api_key:
             t0 = time.perf_counter()
             try:
-                plan, tokens = await self._plan_openai(query, available_services, memory_context)
-                return plan, {"provider": "openai", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
+                plan, tokens = await self._plan_openai(query, filtered, memory_context)
+                plan = self.optimizer.optimize_plan(plan, query)
+                self.optimizer.cache_plan(query, service_ids, plan)
+                return plan, {"provider": "openai", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens, "intent": intent}
             except Exception as e:
                 logger.warning(f"OpenAI planning failed, falling back to mock: {e}")
+        elif self.provider == "openrouter" and settings.openrouter_api_key:
+            t0 = time.perf_counter()
+            try:
+                plan, tokens = await self._plan_openrouter(query, filtered, memory_context)
+                plan = self.optimizer.optimize_plan(plan, query)
+                self.optimizer.cache_plan(query, service_ids, plan)
+                return plan, {"provider": "openrouter", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens, "intent": intent}
+            except Exception as e:
+                logger.warning(f"OpenRouter planning failed, falling back to mock: {e}")
         elif self.provider == "gemini" and settings.gemini_api_key:
             t0 = time.perf_counter()
             try:
-                plan, tokens = await self._plan_gemini(query, available_services, memory_context)
-                return plan, {"provider": "gemini", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
+                plan, tokens = await self._plan_gemini(query, filtered, memory_context)
+                plan = self.optimizer.optimize_plan(plan, query)
+                self.optimizer.cache_plan(query, service_ids, plan)
+                return plan, {"provider": "gemini", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens, "intent": intent}
             except Exception as e:
                 logger.warning(f"Gemini planning failed, falling back to mock: {e}")
+        elif self.provider == "nvidia" and settings.nvidia_api_key:
+            t0 = time.perf_counter()
+            try:
+                plan, tokens = await self._plan_nvidia(query, filtered, memory_context)
+                plan = self.optimizer.optimize_plan(plan, query)
+                self.optimizer.cache_plan(query, service_ids, plan)
+                return plan, {"provider": "nvidia", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens, "intent": intent}
+            except Exception as e:
+                logger.warning(f"NVIDIA planning failed, falling back to mock: {e}")
         t0 = time.perf_counter()
         plan = self._plan_mock(query, available_services, memory_context)
-        return plan, {"provider": "mock", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": 0}
+        plan = self.optimizer.optimize_plan(plan, query)
+        self.optimizer.cache_plan(query, service_ids, plan)
+        return plan, {"provider": "mock", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": 0, "intent": intent}
 
     async def correct_plan(
         self,
@@ -99,6 +236,13 @@ class LLMReasoningEngine:
                 return plan, {"provider": "openai", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
             except Exception as e:
                 logger.warning(f"OpenAI self-correction failed: {e}")
+        elif self.provider == "openrouter" and settings.openrouter_api_key:
+            t0 = time.perf_counter()
+            try:
+                plan, tokens = await self._correct_openrouter(original_query, failed_plan, error_message, available_services)
+                return plan, {"provider": "openrouter", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
+            except Exception as e:
+                logger.warning(f"OpenRouter self-correction failed: {e}")
         elif self.provider == "gemini" and settings.gemini_api_key:
             t0 = time.perf_counter()
             try:
@@ -106,6 +250,13 @@ class LLMReasoningEngine:
                 return plan, {"provider": "gemini", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
             except Exception as e:
                 logger.warning(f"Gemini self-correction failed: {e}")
+        elif self.provider == "nvidia" and settings.nvidia_api_key:
+            t0 = time.perf_counter()
+            try:
+                plan, tokens = await self._correct_nvidia(original_query, failed_plan, error_message, available_services)
+                return plan, {"provider": "nvidia", "latency_ms": int((time.perf_counter() - t0) * 1000), "tokens": tokens}
+            except Exception as e:
+                logger.warning(f"NVIDIA self-correction failed: {e}")
         return None, {"provider": "none", "latency_ms": 0, "tokens": 0}
 
     def _plan_mock(
@@ -156,13 +307,18 @@ class LLMReasoningEngine:
     def _pick_service(self, services: List[Dict[str, Any]], q: str) -> Optional[str]:
         if not services:
             return None
+        # Generic tokens that appear in many service names/descriptions — skip for matching
+        generic_tokens = {"odata", "service", "api", "data", "v4", "v2", "v3", "rest", "the", "and", "for", "srv", "local", "order", "manage", "test", "http", "https", "com", "ondemand", "eu10", "cfapps", "it", "cpi001", "rt", "soprasteriagroup"}
+        # First pass: match by service name tokens (explicit mention)
         for svc in services:
-            tokens = re.findall(r"[a-zA-Z]+", (svc.get("name", "") + " " + svc.get("description", "")).lower())
-            if any(t and t in q for t in tokens):
+            name_tokens = re.findall(r"[a-zA-Z]+", svc.get("name", "").lower())
+            if any(t and len(t) > 2 and t not in generic_tokens and t in q for t in name_tokens):
                 return svc["id"]
+        # Second pass: match by entity set name
         for svc in services:
             for es in svc.get("entity_sets", []):
-                if es.lower() in q:
+                es_lower = es.lower().replace("_", " ")
+                if es_lower in q or es.lower() in q:
                     return svc["id"]
         return services[0]["id"]
 
@@ -171,79 +327,110 @@ class LLMReasoningEngine:
         if not svc:
             return None, []
         qn = q.lower()
-
-        analytics_keywords = {"sales", "sale", "revenue", "turnover", "total sales", "percentage", "profit", "income", "earnings"}
-        has_analytics = any(kw in qn for kw in analytics_keywords)
-
-        if has_analytics:
-            found = self._pick_analytics_entity(svc, qn)
-            if found:
-                return found, []
-
-        synonyms = {
-            "sale": ["sale", "invoice", "order"],
-            "sales": ["sale", "invoice", "order"],
-            "revenue": ["sale", "invoice", "order", "revenue"],
-            "turnover": ["sale", "invoice", "order"],
-            "customer": ["customer", "client"],
-            "customers": ["customer", "client"],
-            "client": ["customer", "client"],
-            "order": ["order", "purchase"],
-            "orders": ["order", "purchase"],
-            "purchase": ["order", "purchase"],
-            "purchases": ["order", "purchase"],
-            "product": ["product", "item"],
-            "products": ["product", "item"],
-            "item": ["product", "item", "detail"],
-            "items": ["product", "item", "detail"],
-            "category": ["categor"],
-            "categories": ["categor"],
-            "supplier": ["supplier", "vendor"],
-            "suppliers": ["supplier", "vendor"],
-            "vendor": ["supplier", "vendor"],
-            "employee": ["employ", "staff"],
-            "employees": ["employ", "staff"],
-            "staff": ["employ", "staff"],
-            "shipper": ["ship", "carrier"],
-            "shippers": ["ship", "carrier"],
-            "region": ["region", "territory"],
-            "regions": ["region", "territory"],
-            "territory": ["territory", "region"],
-            "territories": ["territory", "region"],
-            "invoice": ["invoice", "bill"],
-            "invoices": ["invoice", "bill"],
-            "line item": ["detail", "line"],
-            "line items": ["detail", "line"],
-        }
         available_entities = svc.get("entity_sets", [])
-        for token, stems in synonyms.items():
-            if token in qn:
-                # First try exact name match
-                for es in available_entities:
-                    if es.lower() == token or es.lower() == token + "s":
-                        return es, []
-                # Then try stem matching (entity name contains any of the stems)
-                for es in available_entities:
-                    es_lower = es.lower()
-                    if any(stem in es_lower for stem in stems):
-                        return es, []
-        if "how many" in qn or "count" in qn:
-            # Pick the first entity that looks like a main table
-            for es in available_entities:
-                es_lower = es.lower()
-                if not any(v in es_lower for v in ["view", "summary", "list", "by_", "for_", "extended", "subtotal"]):
-                    return es, []
-        if not has_analytics:
-            qn_words = set(re.findall(r'[a-z]+', qn))
-            for es in svc.get("entity_sets", []):
-                es_words = set(re.findall(r'[a-z]+', es.lower()))
-                if es_words and es_words.issubset(qn_words):
-                    return es, []
-        for es in svc.get("entity_sets", []):
-            es_l = es.lower().replace("_", " ")
-            if es_l in qn or es_l.replace(" ", "") in qn.replace(" ", ""):
+        if not available_entities:
+            return None, []
+
+        stop_words = {
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+            "has", "have", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "can", "show", "me", "get", "list", "find",
+            "all", "some", "first", "top", "last", "that", "this", "it", "its",
+            "what", "which", "who", "whom", "how", "many", "much", "count",
+            "total", "sum", "average", "max", "min", "where", "when", "if",
+            "not", "no", "than", "then", "so", "very", "just", "also", "too",
+        }
+        # Also filter out words that appear in the service name (they identify the service, not the entity)
+        svc = next((s for s in services if s["id"] == service_id), None)
+        svc_name_words = set()
+        if svc:
+            svc_name_words = {w.lower() for w in re.findall(r'[a-zA-Z]+', svc.get("name", "")) if len(w) > 2}
+        qn_words = set(re.findall(r'[a-z]+', qn)) - stop_words - svc_name_words
+
+        def stem(word: str) -> str:
+            """Light stemmer: strip common English suffixes."""
+            w = word
+            if w.endswith("ies") and len(w) >= 5:
+                w = w[:-3] + "y"
+            elif w.endswith("es") and len(w) >= 5:
+                w = w[:-2]
+            elif w.endswith("s") and len(w) >= 4:
+                w = w[:-1]
+            for suffix in ("ation", "tion", "ment", "ness", "ible", "able", "ous", "ive", "ing", "ful"):
+                if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+                    w = w[:-len(suffix)]
+                    break
+            return w
+
+        def stem_set(words: set) -> set:
+            """Stem a set of words."""
+            return {stem(w) for w in words}
+
+        def split_entity_words(name: str) -> set:
+            """Split camelCase/PascalCase/underscore entity names into stemmed words."""
+            s = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+            s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', s)
+            s = s.replace("_", " ").replace(".", " ").replace("-", " ")
+            return {stem(w) for w in re.findall(r'[a-z]{2,}', s.lower())}
+
+        def score_entity(es_name: str, q_words: set) -> float:
+            es_words = split_entity_words(es_name)
+            if not es_words or not q_words:
+                return 0.0
+            q_stems = {stem(w) for w in q_words}
+            overlap = q_stems & es_words
+            if not overlap:
+                return 0.0
+            # Jaccard-like: prefer entities with more specific overlap
+            union_size = len(q_stems | es_words)
+            jaccard = len(overlap) / union_size if union_size else 0
+            # Specificity: what fraction of entity words matched
+            specificity = len(overlap) / len(es_words) if es_words else 0
+            # Query stem length bonus: prefer matches on user's longest/most-specific word
+            max_q_stem_len = max(len(s) for s in overlap)
+            q_len_bonus = max_q_stem_len / 10.0
+            # Penalty for overly-simple entity names (e.g. "OperationSet" with 1 word)
+            complexity_penalty = 0.0
+            if len(es_words) < 2:
+                complexity_penalty = 0.6
+            elif len(es_words) < 3:
+                complexity_penalty = 0.2
+            # Bonus for I_* entities (SAP CDS views — typically the queryable data entities)
+            view_bonus = 0.1 if es_name.startswith("I_") else 0.0
+            # Penalty for SAP Value Help entities (dropdown/metadata, not real data)
+            vh_penalty = 0.0
+            if re.search(r'(VH|StdVH|ValueHelp|Value_Help)$', es_name):
+                vh_penalty = 0.4
+            return jaccard + specificity * 0.5 + q_len_bonus - complexity_penalty + view_bonus - vh_penalty
+
+        # Direct name match: if entity name appears in the query, prefer it immediately
+        qn_lower = qn.lower()
+        for es in available_entities:
+            es_lower = es.lower().replace("_", " ")
+            if es_lower in qn_lower or es.lower() in qn_lower:
                 return es, []
-        return svc.get("entity_sets", [None])[0], []
+
+        scored = [(es, score_entity(es, qn_words)) for es in available_entities]
+        scored.sort(key=lambda x: -x[1])
+        logger.info(f"Entity scoring for query '{qn[:60]}': top 5 = {[(es, round(sc, 3)) for es, sc in scored[:5]]}")
+
+        if scored and scored[0][1] > 0:
+            best_score = scored[0][1]
+            # If tie, prefer entity with fewer words (more specific)
+            tied = [es for es, sc in scored if abs(sc - best_score) < 0.01]
+            if len(tied) > 1:
+                best = min(tied, key=lambda es: len(split_entity_words(es)))
+                return best, []
+            return scored[0][0], []
+
+        # Fallback: match entity name mentioned in query
+        for es in available_entities:
+            es_spaced = es.lower().replace("_", " ").replace(".", " ")
+            if es_spaced in qn or es.lower() in qn:
+                return es, []
+
+        return available_entities[0], []
 
     def _pick_analytics_entity(self, svc: Dict[str, Any], qn: str):
         """Generic entity picker for analytics/sales queries.
@@ -404,41 +591,141 @@ class LLMReasoningEngine:
     ) -> Tuple[Dict[str, Any], int]:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
+        mock_plan = self._plan_mock(query, services, memory_context)
+        suggestions = []
+        for step in mock_plan.get("steps", []):
+            suggestions.append({
+                "service_id": step.get("service_id"),
+                "entity_set": step.get("entity_set"),
+            })
+        logger.info(f"Mock suggestions for LLM: {suggestions}")
+
         system_prompt = (
-            "You are an OData query planner. Given a natural language question "
-            "and a list of available OData services with their entity sets and properties, "
-            "output JSON with keys: "
-            "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
-            "and summary. Use only services, entity sets, and properties provided. "
-            "IMPORTANT: Each entity_set includes a 'properties' list - use ONLY those property names in $select and $filter. "
-            "Do NOT guess or invent property names. "
-            "Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
-            "Use the foreign key field directly (e.g. 'CategoryID eq 1'). "
-            "PREDICTION: If the user asks 'what will X be if Y is Z' or 'predict X given Y', "
-            "set intent to 'predict' and add a 'prediction' object to the plan with: "
-            "entity_key (service_entity), features (dict of known values), target (the column to predict). "
-            "Do NOT create steps for prediction queries - only use the prediction object."
+            "OData planner. Output JSON: intent, target_services, steps (service_id, entity_set, select, filter, top, skip, orderby), summary. "
+            "Use ONLY provided entity sets and properties. No navigation properties in $filter. "
+            "Use entity_suggestions — they are pre-scored. Only deviate if clearly wrong. "
+            "AVOID entities ending in VH, StdVH, ValueHelp — these are SAP dropdown metadata, not real data. "
+            "If similar_past_queries are provided, use them as reference for correct entity/filter patterns. "
+            "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
+            "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
+            "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
         )
+
+        suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
+        filtered_services = []
+        for s in services:
+            truncated = self._truncate_service_for_llm(s)
+            if s["id"] in suggested_services:
+                filtered_services.append(truncated)
+            elif len(s.get("entity_sets", [])) <= 10:
+                filtered_services.append(self._truncate_service_for_llm(s))
+
+        # Retrieve similar past plans as few-shot examples (RAG)
+        rag_examples = []
+        for svc_id in suggested_services:
+            examples = query_plan_rag.retrieve_plans(query, service_id=svc_id, n_results=2)
+            rag_examples.extend(examples)
+
+        user_prompt_data = {
+            "query": query,
+            "services": filtered_services,
+            "entity_suggestions": suggestions,
+        }
+        if rag_examples:
+            user_prompt_data["similar_past_queries"] = [
+                {"query": ex["query"], "plan": ex["plan"]} for ex in rag_examples[:3]
+            ]
+
+        user_prompt = json.dumps(user_prompt_data)
+
+        keys = settings.openai_api_keys_list
+        last_error = None
+        for attempt in range(min(len(keys), 3)):
+            api_key = keys[(self._key_index + attempt) % len(keys)] if keys else settings.openai_api_key
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=settings.openai_base_url or None,
+                timeout=30.0,
+            )
+            try:
+                resp = await client.chat.completions.create(
+                    model=self.model or settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                content = resp.choices[0].message.content
+                tokens = 0
+                try:
+                    if hasattr(resp, "usage") and resp.usage:
+                        tokens = getattr(resp.usage, "total_tokens", 0) or 0
+                except Exception:
+                    tokens = 0
+                self._key_index = (self._key_index + attempt) % len(keys) if keys else 0
+                return json.loads(content), tokens
+            except Exception as e:
+                last_error = e
+                if "429" in str(e) or "rate_limit" in str(e):
+                    logger.warning(f"Rate limit on key index {(self._key_index + attempt) % len(keys)}, rotating...")
+                    continue
+                raise
+
+        raise last_error or Exception("All API keys exhausted")
+
+    async def _plan_openrouter(
+        self,
+        query: str,
+        services: List[Dict[str, Any]],
+        memory_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[Dict[str, Any], int]:
+        from openai import AsyncOpenAI
+
+        mock_plan = self._plan_mock(query, services, memory_context)
+        suggestions = []
+        for step in mock_plan.get("steps", []):
+            suggestions.append({
+                "service_id": step.get("service_id"),
+                "entity_set": step.get("entity_set"),
+            })
+
+        system_prompt = (
+            "OData planner. Output JSON: intent, target_services, steps (service_id, entity_set, select, filter, top, skip, orderby), summary. "
+            "Use ONLY provided entity sets and properties. No navigation properties in $filter. "
+            "Use entity_suggestions — they are pre-scored. Only deviate if clearly wrong. "
+            "AVOID entities ending in VH, StdVH, ValueHelp — these are SAP dropdown metadata, not real data. "
+            "If similar_past_queries are provided, use them as reference for correct entity/filter patterns. "
+            "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
+            "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
+            "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
+        )
+
+        suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
+        filtered_services = []
+        for s in services:
+            truncated = self._truncate_service_for_llm(s)
+            if s["id"] in suggested_services:
+                filtered_services.append(truncated)
+            elif len(s.get("entity_sets", [])) <= 10:
+                filtered_services.append(self._truncate_service_for_llm(s))
+
         user_prompt = json.dumps({
             "query": query,
-            "services": [
-                {
-                    "id": s["id"],
-                    "name": s["name"],
-                    "entity_sets": s.get("entity_sets", []),
-                    "entity_properties": s.get("entity_properties", {}),
-                    "description": s.get("description", ""),
-                }
-                for s in services
-            ],
-            "memory_context": memory_context or [],
+            "services": filtered_services,
+            "entity_suggestions": suggestions,
         })
+
+        client = AsyncOpenAI(
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            timeout=30.0,
+        )
+        model = self.model or settings.openrouter_model
         resp = await client.chat.completions.create(
-            model=self.model or settings.llm_model,
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -452,10 +739,169 @@ class LLMReasoningEngine:
                 tokens = getattr(resp.usage, "total_tokens", 0) or 0
         except Exception:
             tokens = 0
+        return json.loads(content), tokens
+
+    async def _correct_openrouter(
+        self,
+        original_query: str,
+        failed_plan: Dict[str, Any],
+        error_message: str,
+        services: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], int]:
+        from openai import AsyncOpenAI
+
+        system_prompt = (
+            "You are an OData query fixer. The previous plan failed at the OData layer. "
+            "Diagnose the error and produce a corrected JSON plan. "
+            "Rules: do NOT use navigation properties in $filter (use the FK field); "
+            "use only valid OData v4 operators (eq, ne, gt, lt, ge, le, and, or, not, contains, startswith); "
+            "use only entity sets and properties that exist in the listed services."
+        )
+        user_prompt = json.dumps({
+            "original_query": original_query,
+            "failed_plan": failed_plan,
+            "error": error_message,
+            "services": [self._truncate_service_for_llm(s) for s in services],
+        })
+
+        client = AsyncOpenAI(
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            timeout=30.0,
+        )
+        model = self.model or settings.openrouter_model
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content
+        tokens = 0
         try:
-            return json.loads(content), tokens
+            if hasattr(resp, "usage") and resp.usage:
+                tokens = getattr(resp.usage, "total_tokens", 0) or 0
         except Exception:
-            return self._plan_mock(query, services, memory_context), tokens
+            tokens = 0
+        return json.loads(content), tokens
+
+    async def _plan_nvidia(
+        self,
+        query: str,
+        services: List[Dict[str, Any]],
+        memory_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[Dict[str, Any], int]:
+        from openai import AsyncOpenAI
+
+        mock_plan = self._plan_mock(query, services, memory_context)
+        suggestions = []
+        for step in mock_plan.get("steps", []):
+            suggestions.append({
+                "service_id": step.get("service_id"),
+                "entity_set": step.get("entity_set"),
+            })
+        logger.info(f"Mock suggestions for NVIDIA LLM: {suggestions}")
+
+        system_prompt = (
+            "OData planner. Output JSON: intent, target_services, steps (service_id, entity_set, select, filter, top, skip, orderby), summary. "
+            "Use ONLY provided entity sets and properties. No navigation properties in $filter. "
+            "Use entity_suggestions — they are pre-scored. Only deviate if clearly wrong. "
+            "AVOID entities ending in VH, StdVH, ValueHelp — these are SAP dropdown metadata, not real data. "
+            "If similar_past_queries are provided, use them as reference for correct entity/filter patterns. "
+            "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
+            "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
+            "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
+        )
+
+        suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
+        filtered_services = []
+        for s in services:
+            if s["id"] in suggested_services:
+                filtered_services.append(self._truncate_service_for_llm(s, max_entities=10, max_props_per_entity=5))
+
+        user_prompt = json.dumps({
+            "query": query,
+            "services": filtered_services,
+            "entity_suggestions": suggestions,
+        })
+
+        client = AsyncOpenAI(
+            api_key=settings.nvidia_api_key,
+            base_url=settings.nvidia_base_url,
+            timeout=30.0,
+        )
+        model = self.model or settings.nvidia_model
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=512,
+        )
+        content = resp.choices[0].message.content
+        tokens = 0
+        try:
+            if hasattr(resp, "usage") and resp.usage:
+                tokens = getattr(resp.usage, "total_tokens", 0) or 0
+        except Exception:
+            tokens = 0
+        return json.loads(content), tokens
+
+    async def _correct_nvidia(
+        self,
+        original_query: str,
+        failed_plan: Dict[str, Any],
+        error_message: str,
+        services: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], int]:
+        from openai import AsyncOpenAI
+
+        system_prompt = (
+            "You are an OData query fixer. The previous plan failed at the OData layer. "
+            "Diagnose the error and produce a corrected JSON plan. "
+            "Rules: do NOT use navigation properties in $filter (use the FK field); "
+            "use only valid OData v4 operators (eq, ne, gt, lt, ge, le, and, or, not, contains, startswith); "
+            "use only entity sets and properties that exist in the listed services."
+        )
+        user_prompt = json.dumps({
+            "original_query": original_query,
+            "failed_plan": failed_plan,
+            "error": error_message,
+            "services": [self._truncate_service_for_llm(s, max_entities=10, max_props_per_entity=5) for s in services],
+        })
+
+        client = AsyncOpenAI(
+            api_key=settings.nvidia_api_key,
+            base_url=settings.nvidia_base_url,
+            timeout=30.0,
+        )
+        model = self.model or settings.nvidia_model
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=512,
+        )
+        content = resp.choices[0].message.content
+        tokens = 0
+        try:
+            if hasattr(resp, "usage") and resp.usage:
+                tokens = getattr(resp.usage, "total_tokens", 0) or 0
+        except Exception:
+            tokens = 0
+        return json.loads(content), tokens
 
     async def _plan_gemini(
         self,
@@ -468,34 +914,37 @@ class LLMReasoningEngine:
 
         client = genai.Client(api_key=settings.gemini_api_key)
         model = self.model or settings.llm_model or "gemini-2.0-flash"
+
+        mock_plan = self._plan_mock(query, services, memory_context)
+        suggestions = []
+        for step in mock_plan.get("steps", []):
+            suggestions.append({
+                "service_id": step.get("service_id"),
+                "entity_set": step.get("entity_set"),
+            })
+
         system_prompt = (
-            "You are an OData query planner. Given a natural language question "
-            "and a list of available OData services with their entity sets and properties, "
-            "output JSON with keys: "
-            "intent, target_services, steps (each with service_id, entity_set, select, filter, expand, orderby, top, skip), "
-            "and summary. Use only services, entity sets, and properties provided. "
-            "IMPORTANT: Each entity_set includes a 'properties' list - use ONLY those property names in $select and $filter. "
-            "Do NOT guess or invent property names. "
-            "Do NOT use navigation properties (e.g. 'Category/Name') in $filter. "
-            "Use the foreign key field directly (e.g. 'CategoryID eq 1'). "
-            "PREDICTION: If the user asks 'what will X be if Y is Z' or 'predict X given Y', "
-            "set intent to 'predict' and add a 'prediction' object to the plan with: "
-            "entity_key (service_entity), features (dict of known values), target (the column to predict). "
-            "Do NOT create steps for prediction queries - only use the prediction object."
+            "OData planner. Output JSON: intent, target_services, steps (service_id, entity_set, select, filter, top, skip, orderby), summary. "
+            "Use ONLY provided entity sets and properties. No navigation properties in $filter. "
+            "Use entity_suggestions — they are pre-scored. Only deviate if clearly wrong. "
+            "AVOID entities ending in VH, StdVH, ValueHelp — these are SAP dropdown metadata, not real data. "
+            "If similar_past_queries are provided, use them as reference for correct entity/filter patterns. "
+            "For 'top N X by Y count/total' queries: create 2 steps — one per entity needed. The backend joins them in Python. "
+            "Example: 'top 5 customers by order count' → step1: Customers (top=200), step2: Orders (top=200). "
+            "OData does NOT support JOINs/GROUP BY — backend does aggregation in Python. "
+            "For prediction queries: set intent='predict', add prediction object (entity_key, features, target). No steps."
         )
+
+        suggested_services = set(s["service_id"] for s in suggestions if s.get("service_id"))
+        filtered_services = []
+        for s in services:
+            if s["id"] in suggested_services:
+                filtered_services.append(self._truncate_service_for_llm(s))
+
         user_prompt = json.dumps({
             "query": query,
-            "services": [
-                {
-                    "id": s["id"],
-                    "name": s["name"],
-                    "entity_sets": s.get("entity_sets", []),
-                    "entity_properties": s.get("entity_properties", {}),
-                    "description": s.get("description", ""),
-                }
-                for s in services
-            ],
-            "memory_context": memory_context or [],
+            "services": filtered_services,
+            "entity_suggestions": suggestions,
         })
         resp = await client.aio.models.generate_content(
             model=model,
@@ -526,10 +975,6 @@ class LLMReasoningEngine:
     ) -> Tuple[Optional[Dict[str, Any]], int]:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
         system_prompt = (
             "You are an OData query fixer. The previous plan failed at the OData layer. "
             "Diagnose the error and produce a corrected JSON plan. "
@@ -541,30 +986,44 @@ class LLMReasoningEngine:
             "original_query": original_query,
             "failed_plan": failed_plan,
             "error": error_message,
-            "services": [
-                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", []), "entity_properties": s.get("entity_properties", {})}
-                for s in services
-            ],
+            "services": [self._truncate_service_for_llm(s) for s in services],
         })
-        resp = await client.chat.completions.create(
-            model=self.model or settings.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content
-        tokens = 0
-        try:
-            if hasattr(resp, "usage") and resp.usage:
-                tokens = getattr(resp.usage, "total_tokens", 0) or 0
-        except Exception:
-            tokens = 0
-        try:
-            return json.loads(content), tokens
-        except Exception:
-            return None, tokens
+
+        keys = settings.openai_api_keys_list
+        last_error = None
+        for attempt in range(min(len(keys), 3)):
+            api_key = keys[(self._key_index + attempt) % len(keys)] if keys else settings.openai_api_key
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=settings.openai_base_url or None,
+                timeout=30.0,
+            )
+            try:
+                resp = await client.chat.completions.create(
+                    model=self.model or settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                content = resp.choices[0].message.content
+                tokens = 0
+                try:
+                    if hasattr(resp, "usage") and resp.usage:
+                        tokens = getattr(resp.usage, "total_tokens", 0) or 0
+                except Exception:
+                    tokens = 0
+                self._key_index = (self._key_index + attempt) % len(keys) if keys else 0
+                return json.loads(content), tokens
+            except Exception as e:
+                last_error = e
+                if "429" in str(e) or "rate_limit" in str(e):
+                    logger.warning(f"Rate limit on correction key index {(self._key_index + attempt) % len(keys)}, rotating...")
+                    continue
+                raise
+
+        return None, 0
 
     async def _correct_gemini(
         self,
@@ -589,10 +1048,7 @@ class LLMReasoningEngine:
             "original_query": original_query,
             "failed_plan": failed_plan,
             "error": error_message,
-            "services": [
-                {"id": s["id"], "name": s["name"], "entity_sets": s.get("entity_sets", []), "entity_properties": s.get("entity_properties", {})}
-                for s in services
-            ],
+            "services": [self._truncate_service_for_llm(s) for s in services],
         })
         resp = await client.aio.models.generate_content(
             model=model,

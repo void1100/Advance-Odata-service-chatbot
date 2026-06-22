@@ -157,6 +157,18 @@ body { color-scheme: var(--color-scheme); }
 .bubble.assistant { align-self: flex-start; background: var(--bg-bubble-assistant); color: var(--text); border: 1px solid var(--border); border-bottom-left-radius: 2px; }
 .bubble.system { align-self: center; background: var(--bg-bubble-system); color: var(--text); font-size: 13px; border: 1px solid var(--border); }
 .bubble.assistant .meta { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+.bubble.assistant .meta-hidden { display: none; }
+.bubble.assistant .meta-toggle { font-size: 11px; color: var(--text-faint); cursor: pointer; margin-top: 6px; user-select: none; opacity: 0.6; transition: opacity 0.15s; }
+.bubble.assistant .meta-toggle:hover { opacity: 1; color: var(--text-muted); }
+
+.processing-bubble { display: flex; align-items: center; gap: 8px; }
+.processing-text { color: var(--text-muted); font-size: 13px; }
+.typing-dots { display: inline-flex; gap: 4px; align-items: center; }
+.typing-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); animation: typingBounce 1.2s infinite ease-in-out; }
+.typing-dots span:nth-child(1) { animation-delay: 0s; }
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes typingBounce { 0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); } 40% { opacity: 1; transform: scale(1.1); } }
 
 .table-wrapper { margin-top: 12px; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; max-height: 400px; overflow-y: auto; background: var(--bg-elev); }
 .table-wrapper table { width: 100%; border-collapse: collapse; font-size: 13px; color: var(--text); table-layout: auto; }
@@ -182,9 +194,12 @@ body { color-scheme: var(--color-scheme); }
 .modal-content header h2 { margin: 0; font-size: 18px; color: var(--text); }
 .modal-content .close { background: transparent; border: none; font-size: 20px; cursor: pointer; color: var(--text-muted); }
 #addServiceForm { display: grid; gap: 8px; margin-bottom: 16px; }
-#addServiceForm input { padding: 8px; border: 1px solid var(--border-input); border-radius: 6px; background: var(--bg-input); color: var(--text); }
+#addServiceForm input, #addServiceForm select { padding: 8px; border: 1px solid var(--border-input); border-radius: 6px; background: var(--bg-input); color: var(--text); }
 #addServiceForm input::placeholder { color: var(--text-faint); }
 #addServiceForm button { background: var(--success); color: var(--text-on-accent); border: none; padding: 10px; border-radius: 6px; cursor: pointer; }
+.auth-fields { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); }
+.auth-fields.hidden { display: none; }
+.auth-input.hidden { display: none; }
 .service-list { list-style: none; padding: 0; margin: 0; }
 .service-list li { padding: 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 .service-list .delete { background: var(--danger); color: var(--text-on-accent); border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
@@ -246,9 +261,11 @@ body { color-scheme: var(--color-scheme); }
 }
 .llm-badge.llm-groq, .llm-badge.llm-openai { background: rgba(34, 197, 94, 0.1); color: var(--success); border-color: rgba(34, 197, 94, 0.3); }
 .llm-badge.llm-gemini { background: rgba(59, 130, 246, 0.1); color: var(--info); border-color: rgba(59, 130, 246, 0.3); }
+.llm-badge.llm-openrouter { background: rgba(168, 85, 247, 0.1); color: #a855f7; border-color: rgba(168, 85, 247, 0.3); }
 .llm-badge.llm-mock { background: var(--bg-elev-2); color: var(--text-muted); border-color: var(--border); }
 [data-theme="dark"] .llm-badge.llm-groq, [data-theme="dark"] .llm-badge.llm-openai { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
 [data-theme="dark"] .llm-badge.llm-gemini { background: rgba(59, 130, 246, 0.15); color: #93c5fd; }
+[data-theme="dark"] .llm-badge.llm-openrouter { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
 
 .table-toolbar { display: flex; justify-content: flex-end; padding: 6px 8px; background: var(--bg-table-toolbar); border-bottom: 1px solid var(--border); }
 .csv-btn {

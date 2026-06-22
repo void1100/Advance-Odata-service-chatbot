@@ -118,6 +118,18 @@
           <input type="text" id="svcName" placeholder="display name" required />
           <input type="url" id="svcUrl" placeholder="base url" required />
           <input type="text" id="svcDesc" placeholder="description" />
+          <select id="svcAuthType">
+            <option value="">No Authentication</option>
+            <option value="basic">Basic Auth (username/password)</option>
+            <option value="bearer">Bearer Token</option>
+            <option value="api_key">API Key</option>
+          </select>
+          <div id="authFields" class="auth-fields hidden">
+            <input type="text" id="svcAuthUser" placeholder="username" class="auth-input" />
+            <input type="password" id="svcAuthPass" placeholder="password" class="auth-input" />
+            <input type="text" id="svcAuthToken" placeholder="bearer token" class="auth-input hidden" />
+            <input type="text" id="svcAuthApiKey" placeholder="API key value" class="auth-input hidden" />
+          </div>
           <button type="submit">Register</button>
         </form>
         <ul id="serviceList" class="service-list"></ul>

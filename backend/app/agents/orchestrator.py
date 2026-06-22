@@ -42,6 +42,12 @@ def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
             normalized["target_services"] = [s.strip() for s in ts.split(",") if s.strip()]
         else:
             normalized["target_services"] = []
+    elif ts:
+        # Extract strings from dicts: [{"id":"northwind"}] → ["northwind"]
+        normalized["target_services"] = [
+            s.get("id") or s.get("name") or str(s) if isinstance(s, dict) else str(s)
+            for s in ts
+        ]
     steps = normalized.get("steps") or []
     if not isinstance(steps, list):
         steps = []
@@ -58,7 +64,12 @@ def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         for str_field in ("service_id", "entity_set", "filter"):
             v = s.get(str_field)
             if v is not None and not isinstance(v, str):
-                s[str_field] = str(v)
+                if isinstance(v, dict):
+                    s[str_field] = v.get("id") or v.get("name") or str(v)
+                elif isinstance(v, list):
+                    s[str_field] = v[0] if v else ""
+                else:
+                    s[str_field] = str(v)
         for int_field in ("top", "skip"):
             v = s.get(int_field)
             if v == "" or v is None:
@@ -83,14 +94,19 @@ def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_safety_caps(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure every step has a $top cap to prevent accidental huge responses."""
+    """Ensure every step has a $top cap to prevent accidental huge responses.
+    SAP CPI services have strict row limits (often 2-5), so we use a lower cap."""
     if not plan:
         return plan
     for step in plan.get("steps", []):
+        service_id = step.get("service_id", "")
+        svc = service_manager._services.get(service_id, {})
+        is_sap_cpi = "service=" in svc.get("base_url", "").lower() or "metadata=true" in svc.get("base_url", "").lower()
+        cap = 2 if is_sap_cpi else TOP_SAFETY_CAP
         if step.get("top") is None:
-            step["top"] = TOP_SAFETY_CAP
-        elif isinstance(step.get("top"), int) and step["top"] > TOP_SAFETY_CAP:
-            step["top"] = TOP_SAFETY_CAP
+            step["top"] = cap
+        elif isinstance(step.get("top"), int) and step["top"] > cap:
+            step["top"] = cap
     return plan
 
 
@@ -315,6 +331,23 @@ class Orchestrator:
         else:
             summary = plan.get("summary", "Done.")
 
+        # Store successful plan in RAG for future retrieval
+        if not error_message and primary_service:
+            try:
+                from app.services.query_rag import query_plan_rag
+                rag_steps = plan.get("steps", [{}])
+                entity = rag_steps[0].get("entity_set", "") if rag_steps else ""
+                query_plan_rag.store_plan(
+                    query=user_query,
+                    plan=plan,
+                    service_id=primary_service,
+                    entity_set=entity,
+                    success=True,
+                )
+                logger.info(f"RAG: Stored plan for '{user_query[:50]}' -> {primary_service}/{entity}")
+            except Exception as e:
+                logger.warning(f"RAG: Failed to store plan: {e}")
+
         return {
             "run_id": run_id,
             "session_id": session_id,
@@ -334,6 +367,7 @@ class Orchestrator:
             "llm_provider": llm_provider,
             "llm_latency_ms": llm_latency_ms,
             "llm_tokens": llm_tokens,
+            "intent": llm_meta.get("intent"),
         }
 
 

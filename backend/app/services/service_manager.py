@@ -72,9 +72,11 @@ class ODataServiceManager:
         base_url: str,
         description: str = "",
         metadata: Optional[Dict[str, Any]] = None,
+        auth_type: Optional[str] = None,
+        auth_config: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         async with self._lock:
-            client = ODataClient(base_url)
+            client = ODataClient(base_url, auth_type=auth_type, auth_config=auth_config)
             try:
                 meta = await client.get_metadata()
             except Exception as e:
@@ -87,6 +89,8 @@ class ODataServiceManager:
                 "description": description,
                 "metadata": meta,
                 "extra": metadata or {},
+                "auth_type": auth_type,
+                "auth_config": auth_config,
             }
             self._clients[service_id] = client
             self._index_service_in_graph(service_id, self._services[service_id])
@@ -101,6 +105,8 @@ class ODataServiceManager:
             "base_url": svc["base_url"],
             "description": svc["description"],
             "metadata": svc.get("extra", {}),
+            "auth_type": svc.get("auth_type"),
+            "auth_config": svc.get("auth_config"),
         })
         entity_set_to_type: Dict[str, str] = {}
         for es in svc["metadata"].get("entity_sets", []):
@@ -215,10 +221,18 @@ class ODataServiceManager:
         out = []
         for sid, svc in self._services.items():
             entity_props = {}
+            et_list = svc["metadata"].get("entity_types", [])
+            et_names = {e["name"] for e in et_list}
             for es in svc["metadata"].get("entity_sets", []):
                 es_name = es["name"]
                 et_name = es.get("entity_type", es_name)
-                et = next((e for e in svc["metadata"].get("entity_types", []) if e["name"] == et_name), None)
+                et = next((e for e in et_list if e["name"] == et_name), None)
+                if not et and "." in et_name:
+                    local_name = et_name.rsplit(".", 1)[-1]
+                    et = next((e for e in et_list if e["name"] == local_name), None)
+                if not et:
+                    # Try partial match: entity_type ends with entity set name
+                    et = next((e for e in et_list if et_name.endswith(e["name"])), None)
                 props = [p["name"] for p in (et or {}).get("properties", [])]
                 entity_props[es_name] = props
             out.append({
@@ -256,6 +270,16 @@ class ODataServiceManager:
                 continue
             if sid in self._services:
                 continue
+            # Recover auth credentials from Neo4j
+            auth_type = svc.get("auth_type")
+            auth_config_str = svc.get("auth_config")
+            auth_config = None
+            if auth_config_str and auth_config_str != "None":
+                import ast
+                try:
+                    auth_config = ast.literal_eval(auth_config_str)
+                except Exception:
+                    auth_config = None
             try:
                 logger.info(f"Recovering service {sid} from graph ...")
                 await self.register_service(
@@ -263,6 +287,8 @@ class ODataServiceManager:
                     name=name or sid,
                     base_url=base_url,
                     description=description,
+                    auth_type=auth_type,
+                    auth_config=auth_config,
                 )
                 logger.info(f"  {sid}: recovered")
             except Exception as e:
@@ -329,13 +355,24 @@ class ODataServiceManager:
         builder = ODataRequestBuilder(client, allowed_ops=allowed_ops, custom_entities=self._custom_entities.get(service_id, {}))
         execution = await builder.execute(plan)
         raw = execution["result"]
-        rows = raw.get("value", []) if isinstance(raw, dict) else []
+        # Handle both standard OData {"value": [...]} and SAP CPI {"EntityType": [...]}
+        if isinstance(raw, dict):
+            rows = raw.get("value", [])
+            if not rows:
+                for v in raw.values():
+                    if isinstance(v, list):
+                        rows = v
+                        break
+        else:
+            rows = []
         total_count = raw.get("@odata.count") if isinstance(raw, dict) else None
         url = execution["url"]
 
         base_url = url.split("?")[0] if "?" in url else url
 
-        if total_count and total_count > len(rows) and total_count <= max_rows:
+        # SAP CPI doesn't support $skip/$top pagination — skip it
+        is_sap_cpi = client._is_sap_cpi() if hasattr(client, '_is_sap_cpi') else False
+        if not is_sap_cpi and total_count and total_count > len(rows) and total_count <= max_rows:
             page_size = len(rows) if len(rows) > 0 else 20
             skip = len(rows)
             while skip < total_count and skip < max_rows:
@@ -370,8 +407,23 @@ class ODataServiceManager:
                 for k in r.keys():
                     if k not in columns and not k.startswith("@odata"):
                         columns.append(k)
-        if len(columns) > 30:
-            columns = columns[:30]
+        # Smart column ordering: important identifiers, names, dates first
+        # Force critical columns to always be first
+        critical_prefixes = {"purchaseorder", "orderid", "orderno", "customerid", "productid",
+                             "supplierid", "employeeid", "orderid", "shipperid", "categoryid"}
+        important_keywords = {"order", "number", "id", "name", "code", "date", "status", "type",
+                              "amount", "total", "price", "qty", "quantity", "supplier", "customer",
+                              "product", "material", "currency", "plant", "company", "organization",
+                              "group", "description", "text"}
+        skip_keywords = {"isend", "has", "flag", "block", "completeness", "deletion", "correspnc",
+                         "manual", "incoterms", "purg", "agr", "conform", "complnc", "quotation",
+                         "resp", "person", "phone", "endofpurpose"}
+        critical_cols = [c for c in columns if any(c.lower().startswith(cp) for cp in critical_prefixes)]
+        priority_cols = [c for c in columns if c not in critical_cols and any(kw in c.lower() for kw in important_keywords) and not any(sk in c.lower() for sk in skip_keywords)]
+        other_cols = [c for c in columns if c not in critical_cols and c not in priority_cols]
+        columns = critical_cols + priority_cols + other_cols
+        if len(columns) > 40:
+            columns = columns[:40]
         cleaned_rows = [{k: v for k, v in r.items() if k in columns} for r in cleaned_rows]
 
         sanitized = {

@@ -17,8 +17,15 @@ class Settings(BaseSettings):
 
     llm_provider: str = "mock"
     openai_api_key: str = ""
+    openai_api_keys: str = ""
     openai_base_url: str = ""
     gemini_api_key: str = ""
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "deepseek/deepseek-r1"
+    nvidia_api_key: str = ""
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_model: str = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
     llm_model: str = "gpt-4o-mini"
     embedding_model: str = "all-MiniLM-L6-v2"
 
@@ -38,6 +45,19 @@ class Settings(BaseSettings):
         if self.jwt_secret:
             return self.jwt_secret
         return secrets.token_hex(32)
+
+    @property
+    def openai_api_keys_list(self) -> List[str]:
+        """Return list of API keys: primary key + any additional keys."""
+        keys = []
+        if self.openai_api_key:
+            keys.append(self.openai_api_key)
+        if self.openai_api_keys:
+            for k in self.openai_api_keys.split(","):
+                k = k.strip()
+                if k and k not in keys:
+                    keys.append(k)
+        return keys
 
 
 settings = Settings()

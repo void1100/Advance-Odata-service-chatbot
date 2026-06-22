@@ -400,12 +400,23 @@ async def list_services_admin(request: Request, user=Depends(require_permission(
 @router.post("/admin/services")
 async def register_service_admin(request: Request, body: ServiceRegister, user=Depends(require_permission("services"))):
     from app.services.service_manager import service_manager
+    # Build auth config from payload
+    auth_type = body.auth_type
+    auth_config = {}
+    if auth_type == "basic" and body.auth_username:
+        auth_config = {"username": body.auth_username, "password": body.auth_password or ""}
+    elif auth_type == "bearer" and body.auth_token:
+        auth_config = {"token": body.auth_token}
+    elif auth_type == "api_key" and body.auth_api_key:
+        auth_config = {"api_key": body.auth_api_key, "header_name": body.auth_header_name or "X-API-Key"}
     try:
         info = await service_manager.register_service(
             service_id=body.id,
             name=body.name,
             base_url=body.base_url,
             description=body.description or "",
+            auth_type=auth_type,
+            auth_config=auth_config if auth_config else None,
         )
         db = get_auth_db()
         db.log_audit(user_id=user.get("user_id"), username=user.get("sub"), action="create", resource="services", resource_id=body.id, ip_address=request.client.host, status="success")

@@ -69,13 +69,17 @@ class Neo4jClient:
                 SET s.name = $name,
                     s.base_url = $base_url,
                     s.description = $description,
-                    s.metadata = $metadata
+                    s.metadata = $metadata,
+                    s.auth_type = $auth_type,
+                    s.auth_config = $auth_config
                 """,
                 id=service["id"],
                 name=service["name"],
                 base_url=service["base_url"],
                 description=service.get("description", ""),
                 metadata=str(service.get("metadata", {})),
+                auth_type=service.get("auth_type"),
+                auth_config=str(service.get("auth_config")) if service.get("auth_config") else None,
             )
 
     def upsert_entity(self, entity: Dict[str, Any]):

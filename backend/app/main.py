@@ -87,7 +87,9 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    from app.services.query_optimizer import query_optimizer
+    from app.services.query_rag import query_plan_rag
+    return {"status": "ok", "optimizer": query_optimizer.stats, "rag": query_plan_rag.get_stats()}
 
 
 @app.get("/services", response_model=List[ServiceInfo])
@@ -102,11 +104,22 @@ async def register_service(payload: ServiceRegister, request: Request):
     user = get_current_user(request)
     if not user or user.get("role") not in ("super_admin", "admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
+    # Build auth config from payload
+    auth_type = payload.auth_type
+    auth_config = {}
+    if auth_type == "basic" and payload.auth_username:
+        auth_config = {"username": payload.auth_username, "password": payload.auth_password or ""}
+    elif auth_type == "bearer" and payload.auth_token:
+        auth_config = {"token": payload.auth_token}
+    elif auth_type == "api_key" and payload.auth_api_key:
+        auth_config = {"api_key": payload.auth_api_key, "header_name": payload.auth_header_name or "X-API-Key"}
     svc = await service_manager.register_service(
         service_id=payload.id,
         name=payload.name,
         base_url=payload.base_url,
         description=payload.description,
+        auth_type=auth_type,
+        auth_config=auth_config if auth_config else None,
     )
     return ServiceInfo(
         id=svc["id"],
@@ -633,6 +646,14 @@ LLM_CATALOG = [
     {"id": "groq-mixtral-8x7b", "provider": "openai", "label": "Groq: Mixtral 8x7B (32k ctx)", "model": "mixtral-8x7b-32768", "requires": ["openai_key", "groq_base_url"]},
     {"id": "gemini-flash", "provider": "gemini", "label": "Gemini: Flash (latest)", "model": "gemini-flash-latest", "requires": ["gemini_key"]},
     {"id": "gemini-2.0-flash", "provider": "gemini", "label": "Gemini: 2.0 Flash", "model": "gemini-2.0-flash", "requires": ["gemini_key"]},
+    {"id": "openrouter-deepseek-r1", "provider": "openrouter", "label": "OpenRouter: DeepSeek R1 (best reasoning)", "model": "deepseek/deepseek-r1", "requires": ["openrouter_key"]},
+    {"id": "openrouter-claude-3.5-sonnet", "provider": "openrouter", "label": "OpenRouter: Claude 3.5 Sonnet", "model": "anthropic/claude-3.5-sonnet", "requires": ["openrouter_key"]},
+    {"id": "openrouter-gpt-4o", "provider": "openrouter", "label": "OpenRouter: GPT-4o", "model": "openai/gpt-4o", "requires": ["openrouter_key"]},
+    {"id": "openrouter-llama-3.3-70b", "provider": "openrouter", "label": "OpenRouter: Llama 3.3 70B", "model": "meta-llama/llama-3.3-70b-versatile", "requires": ["openrouter_key"]},
+    {"id": "nvidia-nemotron-30b", "provider": "nvidia", "label": "NVIDIA: Nemotron 30B Reasoning (slow, high tokens)", "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "requires": ["nvidia_key"]},
+    {"id": "nvidia-llama-3.1-8b", "provider": "nvidia", "label": "NVIDIA: Llama 3.1 8B Instruct (fastest)", "model": "meta/llama-3.1-8b-instruct", "requires": ["nvidia_key"]},
+    {"id": "nvidia-llama-3.3-70b", "provider": "nvidia", "label": "NVIDIA: Llama 3.3 70B Instruct (smart)", "model": "meta/llama-3.3-70b-instruct", "requires": ["nvidia_key"]},
+    {"id": "nvidia-nemotron-nano-30b", "provider": "nvidia", "label": "NVIDIA: Nemotron Nano 30B (fast, no reasoning)", "model": "nvidia/nemotron-3-nano-30b-a3b", "requires": ["nvidia_key"]},
 ]
 
 
@@ -640,6 +661,8 @@ def _llm_requirements_status() -> Dict[str, bool]:
     return {
         "openai_key": bool(settings.openai_api_key),
         "gemini_key": bool(settings.gemini_api_key),
+        "openrouter_key": bool(settings.openrouter_api_key),
+        "nvidia_key": bool(settings.nvidia_api_key),
         "groq_base_url": "groq.com" in (settings.openai_base_url or ""),
     }
 
@@ -860,16 +883,24 @@ async def chat(payload: ChatRequest, request: Request):
                 )
 
     # Multi-entity aggregation (e.g., sales by country needs Customers+Orders+Order_Details)
+    # When user mentions a service name, scope to that service only
     from app.services.multi_entity_aggregator import detect_multi_entity_query, execute_multi_entity_aggregation
     services_list = service_manager.list_services()
+    q_lower = payload.query.lower()
+    explicit_service = None
     for svc in services_list:
+        if svc["id"].lower() in q_lower or svc["name"].lower() in q_lower:
+            explicit_service = svc["id"]
+            break
+    # Always try multi-entity aggregation — scope to explicit service if mentioned
+    services_to_check = [s for s in services_list if not explicit_service or s["id"] == explicit_service]
+    for svc in services_to_check:
         svc_id = svc["id"]
         client = service_manager.get_client(svc_id)
         if not client:
             continue
         entity_cols = {}
         for es in svc.get("entity_sets", []):
-            # Dynamic view detection: skip entities that are likely views/queries
             es_lower = es.lower()
             if any(vp in es_lower for vp in ("summary", "by_", "for_", "list_of", "extended", "subtotal", "quarterly", "annual")):
                 continue
@@ -892,7 +923,6 @@ async def chat(payload: ChatRequest, request: Request):
                 if me_result:
                     tool_calls_me = [{"type": "multi_entity", "service_id": svc_id, "chain": [s["entity"] for s in me_info["chain"]], "row_count": me_result["row_count"]}]
                     add_message(session_id, "assistant", me_result.get("summary", ""), plan=None, result={"table": me_result, "tool_calls": tool_calls_me})
-                    # Generate chart recommendations for multi-entity results
                     me_chart_recs = []
                     try:
                         me_chart_recs = recommend_charts(me_result.get("rows", []), me_result.get("columns", []), payload.query)
@@ -1120,6 +1150,7 @@ async def chat(payload: ChatRequest, request: Request):
         llm_tokens=result.get("llm_tokens", 0),
         chart_recommendations=chart_recs,
         drill_down_links=drill_links,
+        intent=result.get("intent"),
     )
 
 
@@ -1132,13 +1163,18 @@ async def get_suggestions():
 @app.get("/cache/stats")
 async def get_cache_stats():
     from app.services.query_enhancements import query_cache
-    return query_cache.stats()
+    from app.services.query_optimizer import query_optimizer
+    query_stats = query_cache.stats()
+    query_stats["optimizer"] = query_optimizer.stats
+    return query_stats
 
 
 @app.post("/cache/clear")
 async def clear_cache():
     from app.services.query_enhancements import query_cache
+    from app.services.query_optimizer import query_optimizer
     query_cache.clear()
+    query_optimizer.clear_cache()
     return {"ok": True}
 
 

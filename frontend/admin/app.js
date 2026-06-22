@@ -427,6 +427,20 @@ function showAddService() {
       <div class="form-group"><label>Name</label><input type="text" id="newServiceName" required></div>
       <div class="form-group"><label>Base URL</label><input type="url" id="newServiceUrl" required placeholder="https://services.odata.org/V4/Northwind/Northwind.svc"></div>
       <div class="form-group"><label>Description</label><input type="text" id="newServiceDesc"></div>
+      <div class="form-group"><label>Authentication</label>
+        <select id="newServiceAuthType" onchange="toggleAuthFields()">
+          <option value="">No Authentication</option>
+          <option value="basic">Basic Auth (Username/Password)</option>
+          <option value="bearer">Bearer Token</option>
+          <option value="api_key">API Key</option>
+        </select>
+      </div>
+      <div id="authFieldsContainer" style="display:none">
+        <div class="form-group" id="authUserGroup" style="display:none"><label>Username</label><input type="text" id="newServiceAuthUser"></div>
+        <div class="form-group" id="authPassGroup" style="display:none"><label>Password</label><input type="password" id="newServiceAuthPass"></div>
+        <div class="form-group" id="authTokenGroup" style="display:none"><label>Bearer Token</label><input type="text" id="newServiceAuthToken"></div>
+        <div class="form-group" id="authApiKeyGroup" style="display:none"><label>API Key</label><input type="text" id="newServiceAuthApiKey"></div>
+      </div>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" onclick="closeModal()">Cancel</button>
         <button type="submit" class="btn btn-primary">Register</button>
@@ -435,15 +449,36 @@ function showAddService() {
   `);
 }
 
+function toggleAuthFields() {
+  const t = document.getElementById("newServiceAuthType").value;
+  const container = document.getElementById("authFieldsContainer");
+  container.style.display = t ? "block" : "none";
+  document.getElementById("authUserGroup").style.display = t === "basic" ? "block" : "none";
+  document.getElementById("authPassGroup").style.display = t === "basic" ? "block" : "none";
+  document.getElementById("authTokenGroup").style.display = t === "bearer" ? "block" : "none";
+  document.getElementById("authApiKeyGroup").style.display = t === "api_key" ? "block" : "none";
+}
+
 async function addService(e) {
   e.preventDefault();
+  const authType = document.getElementById("newServiceAuthType").value;
+  const body = {
+    id: document.getElementById("newServiceId").value,
+    name: document.getElementById("newServiceName").value,
+    base_url: document.getElementById("newServiceUrl").value,
+    description: document.getElementById("newServiceDesc").value,
+    auth_type: authType || null,
+  };
+  if (authType === "basic") {
+    body.auth_username = document.getElementById("newServiceAuthUser").value;
+    body.auth_password = document.getElementById("newServiceAuthPass").value;
+  } else if (authType === "bearer") {
+    body.auth_token = document.getElementById("newServiceAuthToken").value;
+  } else if (authType === "api_key") {
+    body.auth_api_key = document.getElementById("newServiceAuthApiKey").value;
+  }
   try {
-    await api("/admin/services", { method: "POST", body: {
-      id: document.getElementById("newServiceId").value,
-      name: document.getElementById("newServiceName").value,
-      base_url: document.getElementById("newServiceUrl").value,
-      description: document.getElementById("newServiceDesc").value,
-    }});
+    await api("/admin/services", { method: "POST", body });
     closeModal(); toast("Service registered"); loadServices(document.getElementById("pageContent"));
   } catch (e) { toast(e.message, "error"); }
 }

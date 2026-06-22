@@ -7,6 +7,12 @@ class ServiceRegister(BaseModel):
     name: str
     base_url: str
     description: str = ""
+    auth_type: Optional[str] = Field(None, description="Authentication type: 'basic', 'bearer', or 'api_key'")
+    auth_username: Optional[str] = Field(None, description="Username for Basic Auth")
+    auth_password: Optional[str] = Field(None, description="Password for Basic Auth")
+    auth_token: Optional[str] = Field(None, description="Token for Bearer Auth")
+    auth_api_key: Optional[str] = Field(None, description="API Key value")
+    auth_header_name: Optional[str] = Field(None, description="Header name for API Key")
 
 
 class ServiceInfo(BaseModel):
@@ -15,6 +21,7 @@ class ServiceInfo(BaseModel):
     base_url: str
     description: str = ""
     entity_sets: List[str] = []
+    entity_properties: Dict[str, List[str]] = {}
 
 
 class ChatRequest(BaseModel):
@@ -81,6 +88,7 @@ class ChatResponse(BaseModel):
     chart_recommendations: List[Dict[str, Any]] = []
     drill_down_links: List[Dict[str, Any]] = []
     cached: bool = False
+    intent: Optional[str] = None
 
 
 class SessionCreate(BaseModel):

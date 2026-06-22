@@ -23,7 +23,8 @@ def detect_post_processing(query: str) -> Optional[Dict[str, Any]]:
 
     has_percentage = bool(re.search(r'percent|percentage|%', q))
     has_compare = bool(re.search(r'compare|comparison|versus|vs', q)) or len(mentioned) >= 2
-    has_extremum = bool(re.search(r'least|fewest|lowest|minimum|most|highest|greatest|maximum', q))
+    # Extremum: only trigger for "which has the most/least" patterns, not "sorted by most"
+    has_extremum = bool(re.search(r'\b(which|what)\b.*\b(has|have|is|are)\b.*\b(most|least|highest|lowest|fewest|greatest|maximum|minimum)\b', q))
     has_ratio = bool(re.search(r'ratio', q))
 
     if has_compare and len(mentioned) >= 2:

@@ -29,6 +29,12 @@ AGGREGATION_QUERY_PATTERNS = [
     (r'average.*?(?:order|transaction|sale|purchase|deal|invoice)', "avg_per_order"),
     (r'(?:count|number|total)\s+(?:of\s+)?(?:orders|transactions|sales|purchases|deals|invoices|bills)', "count_orders"),
     (r'(?:orders|transactions|sales|purchases|deals|invoices|bills)\s+(?:per|by|from|of)', "count_orders"),
+    (r'\bby\s+\w+\s+count\b', "count_orders"),  # "by order count"
+    (r'\bby\s+\w+\s+total\b', "sales"),  # "by sales total"
+    (r'\bby\s+\w+\s+sum\b', "sales"),  # "by revenue sum"
+    (r'\bper\s+\w+\b.*\bcount\b', "count_orders"),  # "per customer count"
+    (r'\btop\s+\d+\b.*\bby\b.*\bcount\b', "count_orders"),  # "top 5 by ... count"
+    (r'\btop\s+\d+\b.*\bby\b.*\btotal\b', "sales"),  # "top 5 by ... total"
 ]
 
 GROUP_WORD_TO_COLUMN = {
@@ -236,12 +242,22 @@ def detect_multi_entity_query(query: str, service_id: str, entity_columns: Optio
     if not entity_columns:
         return None
 
-    group_match = re.search(r'(?:by|per)\s+(?:each|every|all)?\s*(\w+)', q)
-    if not group_match:
-        group_match = re.search(r'(?:from|of)\s+(?:each|every|all)?\s*(\w+)', q)
-    if not group_match:
-        return None
-    group_word = group_match.group(1)
+    # For "top N X by Y count/total" → group_word = X (before "by"), not Y (after "by")
+    top_by_match = re.search(r'top\s+\d+\s+(\w+)\s+by\s+(\w+)', q)
+    if top_by_match:
+        group_word = top_by_match.group(1)
+    else:
+        # For "X by Y count" → group_word = X (before "by")
+        by_match = re.search(r'(\w+)\s+(?:by|per)\s+(?:each|every|all)?\s*(\w+)', q)
+        if by_match:
+            group_word = by_match.group(1)
+        else:
+            group_match = re.search(r'(?:by|per)\s+(?:each|every|all)?\s*(\w+)', q)
+            if not group_match:
+                group_match = re.search(r'(?:from|of)\s+(?:each|every|all)?\s*(\w+)', q)
+            if not group_match:
+                return None
+            group_word = group_match.group(1)
 
     group_loc = _find_group_column(group_word, entity_columns)
     if not group_loc:
@@ -284,17 +300,57 @@ def detect_multi_entity_query(query: str, service_id: str, entity_columns: Optio
         relationships = _detect_entity_relationships(entity_columns)
         order_entities = set()
         for ent, cols in entity_columns.items():
-            for c in cols:
-                if any(kw in c.lower() for kw in ("orderid", "order_id", "transactionid", "invoiceid", "billid", "dealid")):
-                    order_entities.add(ent)
+            has_order_col = any(any(kw in c.lower() for kw in ("orderid", "order_id", "transactionid", "invoiceid", "billid", "dealid")) for c in cols)
+            has_group_col = any(group_col.lower() in c.lower() or c.lower().startswith(group_col.lower()) for c in cols)
+            if has_order_col and has_group_col and ent != group_entity:
+                order_entities.add(ent)
 
         if not order_entities:
             order_entities = set(entity_columns.keys()) - {group_entity}
 
-        chain = _build_chain(group_entity, group_col, order_entities, relationships, list(entity_columns.keys()))
-        if not chain:
+        best_entity = None
+        best_score = -1
+        for ent in order_entities:
+            cols = entity_columns.get(ent, [])
+            order_cols = [c for c in cols if "orderid" in c.lower() or "order_id" in c.lower()]
+            group_cols = [c for c in cols if group_col.lower() in c.lower() or c.lower().startswith(group_col.lower())]
+            specificity = len(order_cols) + len(group_cols)
+            simplicity = 1.0 / max(len(cols), 1)
+            score = specificity + simplicity
+            if score > best_score:
+                best_score = score
+                best_entity = ent
+
+        if not best_entity:
             return None
 
+        best_cols = entity_columns.get(best_entity, [])
+        order_id_col = next((c for c in best_cols if "orderid" in c.lower() or "order_id" in c.lower()), None)
+        group_entity_cols = entity_columns.get(group_entity, [])
+        group_col_candidates = [c for c in group_entity_cols if group_col.lower() in c.lower() or c.lower().startswith(group_col.lower())]
+        q_lower = query.lower()
+        desired_keywords = []
+        for kw in ("country", "contact", "company", "city", "region", "address", "phone", "title"):
+            if kw in q_lower:
+                desired_keywords.append(kw)
+        display_cols = []
+        for c in group_entity_cols:
+            if c in group_col_candidates:
+                continue
+            cl = c.lower()
+            if any(kw in cl for kw in desired_keywords):
+                display_cols.append(c)
+        if len(display_cols) < 3:
+            for c in group_entity_cols:
+                if c not in group_col_candidates and c not in display_cols:
+                    display_cols.append(c)
+                if len(display_cols) >= 6:
+                    break
+
+        chain = [
+            {"entity": group_entity, "key": None, "link_to": None, "columns_to_keep": [group_col] + display_cols},
+            {"entity": best_entity, "key": group_col, "link_to": group_col, "columns_to_keep": [order_id_col] if order_id_col else []},
+        ]
         _ensure_join_keys(chain)
 
         return {
@@ -354,6 +410,62 @@ async def execute_multi_entity_aggregation(
             logger.info(f"Multi-entity: fetching {entity} from {service_id}")
             raw = await client.query(entity_set=entity, top=500)
             flat = client.flatten_odata_value(raw)
+
+            total_count = None
+            if isinstance(raw, dict):
+                total_count = raw.get("@odata.count")
+            if not total_count and isinstance(raw, dict):
+                meta = raw.get("@odata.context", "")
+            base_url = None
+            if hasattr(client, '_get_base_url'):
+                base_url = client._get_base_url()
+            if not base_url:
+                service_url = client.base_url if hasattr(client, 'base_url') else ""
+                if service_url:
+                    base_url = service_url.rstrip("/") + "/" + entity
+
+            if total_count and total_count > len(flat) and base_url:
+                skip = len(flat)
+                page_size = len(flat) if len(flat) > 0 else 200
+                while skip < total_count:
+                    try:
+                        actual_size = min(page_size, 200)
+                        page_url = f"{base_url}?$skip={skip}&$top={actual_size}"
+                        client_obj = await client._get_client()
+                        resp = await client_obj.get(page_url, headers={"Accept": "application/json"})
+                        resp.raise_for_status()
+                        page_data = resp.json()
+                        page_rows = page_data.get("value", [])
+                        if not page_rows:
+                            break
+                        flat.extend(page_rows)
+                        skip += len(page_rows)
+                    except Exception:
+                        break
+            elif not total_count:
+                skip = len(flat)
+                page_size = len(flat) if len(flat) > 0 else 200
+                consecutive_empty = 0
+                while consecutive_empty < 2:
+                    try:
+                        actual_size = min(page_size, 200)
+                        page_url = f"{base_url}?$skip={skip}&$top={actual_size}" if base_url else None
+                        if not page_url:
+                            break
+                        client_obj = await client._get_client()
+                        resp = await client_obj.get(page_url, headers={"Accept": "application/json"})
+                        resp.raise_for_status()
+                        page_data = resp.json()
+                        page_rows = page_data.get("value", [])
+                        if not page_rows:
+                            consecutive_empty += 1
+                            break
+                        flat.extend(page_rows)
+                        skip += len(page_rows)
+                        consecutive_empty = 0
+                    except Exception:
+                        break
+
             cols_to_keep = step.get("columns_to_keep", [])
             if cols_to_keep:
                 flat = [{k: r.get(k) for k in cols_to_keep if k in r} for r in flat]
@@ -455,20 +567,33 @@ async def execute_multi_entity_aggregation(
             for r in joined_rows:
                 g = str(r.get(group_col, "Unknown") or "Unknown")
                 if g not in groups:
-                    groups[g] = set()
-                groups[g].add(r.get(order_id_col))
+                    groups[g] = {"ids": set(), "sample": r}
+                groups[g]["ids"].add(r.get(order_id_col))
 
+            top_n = None
+            top_match = re.search(r'top\s+(\d+)', query.lower())
+            if top_match:
+                top_n = int(top_match.group(1))
+
+            display_cols = [c for c in (list(joined_rows[0].keys()) if joined_rows else []) if c != order_id_col]
             result_rows = []
-            for g, ids in sorted(groups.items(), key=lambda x: len(x[1]), reverse=True):
-                result_rows.append({group_col: g, "order_count": len(ids)})
+            for g, info in sorted(groups.items(), key=lambda x: len(x[1]["ids"]), reverse=True):
+                row = {group_col: g, "order_count": len(info["ids"])}
+                for dc in display_cols:
+                    row[dc] = info["sample"].get(dc)
+                result_rows.append(row)
 
+            if top_n and len(result_rows) > top_n:
+                result_rows = result_rows[:top_n]
+
+            all_cols = [group_col, "order_count"] + [c for c in display_cols if c != group_col]
             return {
-                "columns": [group_col, "order_count"],
+                "columns": all_cols,
                 "rows": result_rows,
                 "row_count": len(result_rows),
                 "truncated": False,
                 "total_count": len(result_rows),
-                "summary": f"Orders by {group_col}: {len(result_rows)} groups from {len(joined_rows)} records",
+                "summary": f"{'Top ' + str(top_n) + ' ' if top_n else ''}Orders by {group_col}: {len(result_rows)} groups from {len(joined_rows)} records",
             }
 
         elif agg_type == "avg_order_by":
